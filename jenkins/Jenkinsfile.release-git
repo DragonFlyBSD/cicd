@@ -1,0 +1,661 @@
+// DragonFlyBSD release pipeline (Git workflow).
+// Derived from the release-rehearsal pipeline. Signing happens OUTSIDE Jenkins:
+// the pipeline commits + pushes branches, emits a signing request, then waits
+// for an authorized signer to push the signed tag and verifies it before
+// finishing. Jenkins holds NO signing private key. See docs/signing.md.
+// Lives in the DragonFlyBSD/cicd repo. See docs/release-pipeline.md.
+// Scope A: Git workflow only. No buildworld/buildkernel, no image builds, no publishing.
+
+def parseVersion(String value) {
+    def m = value.trim() =~ /^(\d+)\.(\d+)\.(\d+)$/
+    if (!m.matches()) {
+        error("Invalid version '${value}'. Expected MAJOR.MINOR.PATCH, e.g. 6.6.0")
+    }
+    return [major: m[0][1].toInteger(), minor: m[0][2].toInteger(), patch: m[0][3].toInteger()]
+}
+
+def readBranchInfo(String checkoutDir) {
+    def newvers = readFile("${checkoutDir}/sys/conf/newvers.sh")
+    def m = newvers =~ /(?m)^BRANCH="(DEVELOPMENT|RELEASE)_(\d+)_(\d+)"\s*$/
+    if (!m.find()) {
+        error('Unable to find BRANCH="DEVELOPMENT_x_y" or BRANCH="RELEASE_x_y" in sys/conf/newvers.sh')
+    }
+    return [kind: m.group(1), major: m.group(2).toInteger(), minor: m.group(3).toInteger()]
+}
+
+def normalizeBranchName(String branch) {
+    String value = branch?.trim()
+    if (!value) {
+        error('BASE_BRANCH is required')
+    }
+    value = value.replaceFirst(/^refs\/heads\//, '')
+    value = value.replaceFirst(/^origin\//, '')
+    if (!(value ==~ /^[A-Za-z0-9._\/-]+$/)) {
+        error("Invalid BASE_BRANCH '${branch}'")
+    }
+    return value
+}
+
+def computeTargetVersion(Map branchInfo, String versionBump, String targetVersion) {
+    if (targetVersion?.trim()) {
+        return parseVersion(targetVersion)
+    }
+
+    int major = branchInfo.major
+    int minor = branchInfo.minor
+
+    if (versionBump == 'major') {
+        return [major: major + 1, minor: 0, patch: 0]
+    }
+    if (versionBump == 'minor') {
+        int nextMinor = (minor % 2 == 0) ? minor + 2 : minor + 1
+        return [major: major, minor: nextMinor, patch: 0]
+    }
+    if (versionBump == 'patch') {
+        if (branchInfo.kind == 'DEVELOPMENT') {
+            error('Patch release from a DEVELOPMENT branch is ambiguous. Set TARGET_VERSION explicitly or use a release branch as BASE_BRANCH.')
+        }
+        return [major: major, minor: minor, patch: 1]
+    }
+    if (versionBump == 'none') {
+        return [major: major, minor: minor, patch: 0]
+    }
+
+    error("Unsupported VERSION_BUMP '${versionBump}'")
+}
+
+def versionString(Map v) {
+    return "${v.major}.${v.minor}.${v.patch}"
+}
+
+def paramVersion(Map v) {
+    return (v.major * 100000) + (v.minor * 100)
+}
+
+def updateNewvers(String checkoutDir, String branchKind, Map v) {
+    String path = "${checkoutDir}/sys/conf/newvers.sh"
+    String text = readFile(path)
+    String replacement = "BRANCH=\"${branchKind}_${v.major}_${v.minor}\""
+    String updated = text.replaceFirst(/(?m)^BRANCH="(?:DEVELOPMENT|RELEASE)_\d+_\d+"\s*$/, replacement)
+    if (updated == text) {
+        error("No BRANCH line updated in ${path}")
+    }
+    writeFile(file: path, text: updated)
+}
+
+def updateMakefileUsrBranch(String checkoutDir, String releaseBranch) {
+    String path = "${checkoutDir}/etc/Makefile.usr"
+    String text = readFile(path)
+    String updated = text.replaceFirst(/(?m)^BRANCH\?=.*$/, "BRANCH?=${releaseBranch}")
+    if (updated == text) {
+        error("No BRANCH?= line updated in ${path}")
+    }
+    writeFile(file: path, text: updated)
+}
+
+def updateParamH(String checkoutDir, Map v, String label) {
+    String path = "${checkoutDir}/sys/sys/param.h"
+    String text = readFile(path)
+    int number = paramVersion(v)
+    String comment = " * ${number} - ${v.major}.${v.minor} ${label}"
+
+    if (!text.contains(comment)) {
+        String marker = ' */\n#undef __DragonFly_version'
+        if (!text.contains(marker)) {
+            error("Unable to locate __DragonFly_version comment block marker in ${path}")
+        }
+        text = text.replace(marker, "${comment}\n${marker}")
+    }
+
+    String updated = text.replaceFirst(/(?m)^#define __DragonFly_version\s+\d+\s+\/\* propagated to newvers \*\//,
+        "#define __DragonFly_version ${number}\t/* propagated to newvers */")
+    if (updated == text) {
+        error("No __DragonFly_version define updated in ${path}")
+    }
+    writeFile(file: path, text: updated)
+}
+
+pipeline {
+    agent {
+        node {
+            label 'dragonflybsd-nvmm large'
+        }
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        // Configured in the Jenkins job, NOT committed here, so this public repo
+        // stays free of environment-specific / personal values. The pipeline
+        // fails closed (see Validate Parameters) if any are unset:
+        //   ALLOWED_ORIGIN_PREFIX : approved writable origin URL prefix
+        //   GIT_AUTHOR_NAME       : commit author name
+        //   GIT_AUTHOR_EMAIL      : commit author email
+        GIT_CREDENTIALS_ID = 'release-rehersal'
+        RELEASE_APPROVERS = 'tuxillo'
+        // Release tooling (this repo): scripts/verify-release-tag and the
+        // keys/authorized-signers allowlist are cloned onto the agent because
+        // this job is an inline pipeline and does not check this repo out.
+        RELEASE_TOOLS_URL = 'https://github.com/DragonFlyBSD/cicd.git'
+        RELEASE_TOOLS_REF = 'master'
+        // How long to wait for the externally-signed tag to appear on origin.
+        SIGNED_TAG_TIMEOUT_HOURS = '3'
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!params.ORIGIN_URL?.trim()) {
+                        error('ORIGIN_URL is required')
+                    }
+                    if (!env.ALLOWED_ORIGIN_PREFIX?.trim()) {
+                        error('ALLOWED_ORIGIN_PREFIX must be configured in the Jenkins job (the approved writable origin URL prefix).')
+                    }
+                    if (!env.GIT_AUTHOR_NAME?.trim() || !env.GIT_AUTHOR_EMAIL?.trim()) {
+                        error('GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL must be configured in the Jenkins job.')
+                    }
+                    if (!params.ORIGIN_URL.startsWith(env.ALLOWED_ORIGIN_PREFIX)) {
+                        error("ORIGIN_URL must start with the approved prefix ${env.ALLOWED_ORIGIN_PREFIX}, got: ${params.ORIGIN_URL}")
+                    }
+                    ['crater.dragonflybsd.org', 'git.dragonflybsd.org', 'mirror-master.dragonflybsd.org'].each { host ->
+                        if (params.ORIGIN_URL.contains(host)) {
+                            error("Refusing production DragonFly origin: ${params.ORIGIN_URL}")
+                        }
+                    }
+                    if (params.BASE_BRANCH?.startsWith('ERROR')) {
+                        error("BASE_BRANCH parameter failed to populate: ${params.BASE_BRANCH}")
+                    }
+                    env.BASE_BRANCH_NORMALIZED = normalizeBranchName(params.BASE_BRANCH)
+                    if (params.RELEASE_STAGE == 'rc' && !(params.RC_NUMBER ==~ /^[1-9][0-9]*$/)) {
+                        error("RC_NUMBER must be a positive integer, got '${params.RC_NUMBER}'")
+                    }
+                    if (params.TARGET_VERSION?.trim()) {
+                        parseVersion(params.TARGET_VERSION.trim())
+                    }
+                }
+            }
+        }
+
+        stage('Clone Origin') {
+            steps {
+                deleteDir()
+                withCredentials([usernamePassword(
+                    credentialsId: env.GIT_CREDENTIALS_ID,
+                    usernameVariable: 'GITEA_USER',
+                    passwordVariable: 'GITEA_TOKEN'
+                )]) {
+                    sh '''
+                        set -eu
+                        cat > git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' "$GITEA_USER" ;;
+*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
+*) printf '\n' ;;
+esac
+EOF
+                        chmod 700 git-askpass.sh
+                        export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                        export GIT_TERMINAL_PROMPT=0
+                        git clone --depth 1 --branch "$BASE_BRANCH_NORMALIZED" -- "$ORIGIN_URL" src
+                        rm -f git-askpass.sh
+                    '''
+                }
+                sh '''
+                    set -eu
+                    cd src
+                    test "$(git remote | wc -l | tr -d ' ')" = "1"
+                    test "$(git remote)" = "origin"
+                    test "$(git remote get-url origin)" = "$ORIGIN_URL"
+                    git config user.name "$GIT_AUTHOR_NAME"
+                    git config user.email "$GIT_AUTHOR_EMAIL"
+                '''
+            }
+        }
+
+        stage('Checkout Release Tools') {
+            // Runs early, before any push, so a non-dry-run fails fast if the
+            // authorized-signers allowlist is empty: there is no point pushing
+            // branches and waiting for a tag that could never verify.
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    export GIT_TERMINAL_PROMPT=0
+                    rm -rf tools
+                    git clone --depth 1 --branch "$RELEASE_TOOLS_REF" -- "$RELEASE_TOOLS_URL" tools
+                    chmod +x tools/scripts/verify-release-tag tools/scripts/sign-release-tag
+                    test -d tools/keys/authorized-signers
+
+                    # Fail closed: refuse to proceed with an empty allowlist.
+                    set -- tools/keys/authorized-signers/*.asc
+                    if [ ! -e "$1" ]; then
+                        echo "No authorized signer public keys in tools/keys/authorized-signers." >&2
+                        echo "Commit an authorized public key before running a non-dry-run release;" >&2
+                        echo "otherwise the pushed tag could never pass verification." >&2
+                        exit 1
+                    fi
+                    echo "Authorized signer keys present:"
+                    for k in tools/keys/authorized-signers/*.asc; do echo "  $k"; done
+                '''
+            }
+        }
+
+        stage('Compute Release Plan') {
+            steps {
+                script {
+                    def branchInfo = readBranchInfo('src')
+                    def target = computeTargetVersion(branchInfo, params.VERSION_BUMP, params.TARGET_VERSION?.trim() ?: '')
+
+                    if (target.minor % 2 != 0) {
+                        error("Target release minor version must be even, got ${versionString(target)}")
+                    }
+
+                    env.CURRENT_BRANCH_KIND = branchInfo.kind
+                    env.CURRENT_BRANCH_VERSION = "${branchInfo.major}.${branchInfo.minor}"
+                    env.TARGET_VERSION_COMPUTED = versionString(target)
+                    env.RELEASE_MAJOR = target.major.toString()
+                    env.RELEASE_MINOR = target.minor.toString()
+                    env.RELEASE_PATCH = target.patch.toString()
+                    env.RELEASE_BRANCH = "DragonFly_RELEASE_${target.major}_${target.minor}"
+                    env.RELEASE_TAG = params.RELEASE_STAGE == 'rc'
+                        ? "v${versionString(target)}rc${params.RC_NUMBER}"
+                        : "v${versionString(target)}"
+                    env.RELEASE_LABEL = params.RELEASE_STAGE == 'rc'
+                        ? "DragonFly ${versionString(target)}rc${params.RC_NUMBER}"
+                        : "DragonFly ${versionString(target)}"
+                    // Worktree whose HEAD the signed tag must point at.
+                    env.SIGNING_WORKTREE = params.VERSION_BUMP == 'patch' ? 'src' : 'release-src'
+
+                    def nextDev = [major: target.major, minor: target.minor + 1, patch: 0]
+                    env.NEXT_DEV_VERSION = versionString(nextDev)
+                    env.NEXT_DEV_MAJOR = nextDev.major.toString()
+                    env.NEXT_DEV_MINOR = nextDev.minor.toString()
+                    env.NEXT_DEV_PATCH = nextDev.patch.toString()
+
+                    writeFile(file: 'release-plan.txt', text: """
+Origin URL: ${params.ORIGIN_URL}
+Base branch: ${env.BASE_BRANCH_NORMALIZED}
+Current source branch marker: ${branchInfo.kind}_${branchInfo.major}_${branchInfo.minor}
+Version bump: ${params.VERSION_BUMP}
+Target version: ${env.TARGET_VERSION_COMPUTED}
+Release stage: ${params.RELEASE_STAGE}
+RC number: ${params.RC_NUMBER}
+Release branch: ${env.RELEASE_BRANCH}
+Release tag: ${env.RELEASE_TAG}
+Next development version: ${env.NEXT_DEV_VERSION}
+Dry run: ${params.DRY_RUN}
+Approver required: ${env.RELEASE_APPROVERS}
+Signing: external (tag signed off-Jenkins, then verified)
+""".stripIndent())
+                }
+            }
+        }
+
+        stage('Check Remote Refs') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.GIT_CREDENTIALS_ID,
+                    usernameVariable: 'GITEA_USER',
+                    passwordVariable: 'GITEA_TOKEN'
+                )]) {
+                    sh '''
+                        set -eu
+                        cat > git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' "$GITEA_USER" ;;
+*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
+*) printf '\n' ;;
+esac
+EOF
+                        chmod 700 git-askpass.sh
+                        export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                        export GIT_TERMINAL_PROMPT=0
+
+                        if git ls-remote --exit-code --tags "$ORIGIN_URL" "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+                            echo "Tag already exists: $RELEASE_TAG" >&2
+                            exit 1
+                        fi
+
+                        if [ "$VERSION_BUMP" != "patch" ]; then
+                            if git ls-remote --exit-code --heads "$ORIGIN_URL" "refs/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+                                echo "Release branch already exists for this non-patch release: $RELEASE_BRANCH" >&2
+                                exit 1
+                            fi
+                        fi
+
+                        if [ "$VERSION_BUMP" = "patch" ]; then
+                            if ! git ls-remote --exit-code --heads "$ORIGIN_URL" "refs/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+                                echo "Patch release branch does not exist: $RELEASE_BRANCH" >&2
+                                exit 1
+                            fi
+                        fi
+
+                        rm -f git-askpass.sh
+                    '''
+                }
+            }
+        }
+
+        stage('Prepare Release Changes') {
+            steps {
+                script {
+                    def target = parseVersion(env.TARGET_VERSION_COMPUTED)
+                    def nextDev = parseVersion(env.NEXT_DEV_VERSION)
+
+                    if (params.VERSION_BUMP == 'patch') {
+                        sh '''
+                            set -eu
+                            cd src
+                            test "$(git rev-parse --abbrev-ref HEAD)" = "$RELEASE_BRANCH"
+                            git diff --binary > ../release-branch.patch
+                            git diff --name-only > ../release-branch.files
+                        '''
+                    } else {
+                        sh 'cd src && git worktree add -b "$RELEASE_BRANCH" ../release-src'
+                        updateNewvers('release-src', 'RELEASE', target)
+                        updateMakefileUsrBranch('release-src', env.RELEASE_BRANCH)
+                        updateParamH('release-src', target, 'release')
+
+                        sh 'cd release-src && git diff --binary > ../release-branch.patch && git diff --name-only > ../release-branch.files'
+
+                        updateNewvers('src', 'DEVELOPMENT', nextDev)
+                        updateParamH('src', nextDev, 'development')
+                    }
+
+                    sh '''
+                        set -eu
+                        cd src
+                        git diff --binary > ../current-branch.patch
+                        git diff --name-only > ../current-branch.files
+                    '''
+
+                    if (params.VERSION_BUMP == 'patch') {
+                        sh ': > master.patch && : > master.files'
+                    } else {
+                        sh 'cp current-branch.patch master.patch && cp current-branch.files master.files'
+                    }
+                }
+            }
+        }
+
+        stage('Archive Review Material') {
+            steps {
+                sh '''
+                    set -eu
+                    {
+                        printf '{\n'
+                        printf '  "origin_url": "%s",\n' "$ORIGIN_URL"
+                        printf '  "base_branch": "%s",\n' "$BASE_BRANCH_NORMALIZED"
+                        printf '  "current_branch_marker": "%s_%s",\n' "$CURRENT_BRANCH_KIND" "$CURRENT_BRANCH_VERSION"
+                        printf '  "version_bump": "%s",\n' "$VERSION_BUMP"
+                        printf '  "target_version": "%s",\n' "$TARGET_VERSION_COMPUTED"
+                        printf '  "release_stage": "%s",\n' "$RELEASE_STAGE"
+                        printf '  "rc_number": "%s",\n' "$RC_NUMBER"
+                        printf '  "release_branch": "%s",\n' "$RELEASE_BRANCH"
+                        printf '  "release_tag": "%s",\n' "$RELEASE_TAG"
+                        printf '  "next_development_version": "%s",\n' "$NEXT_DEV_VERSION"
+                        printf '  "dry_run": "%s"\n' "$DRY_RUN"
+                        printf '}\n'
+                    } > release-metadata.json
+                '''
+                archiveArtifacts artifacts: 'release-plan.txt,release-metadata.json,release-branch.patch,release-branch.files,master.patch,master.files', allowEmptyArchive: false
+            }
+        }
+
+        stage('Approval Gate') {
+            steps {
+                script {
+                    def message = """
+Approve DragonFly release Git workflow?
+
+Origin: ${params.ORIGIN_URL}
+Base branch: ${env.BASE_BRANCH_NORMALIZED}
+Target version: ${env.TARGET_VERSION_COMPUTED}
+Release branch: ${env.RELEASE_BRANCH}
+Release tag: ${env.RELEASE_TAG}
+Dry run: ${params.DRY_RUN}
+
+This approval covers generated diffs, commits, and branch pushes, and emitting
+the signing request. The tag is signed OUTSIDE Jenkins by an authorized signer
+and verified before the build completes.
+Review archived release-plan.txt, release-branch.patch, and master.patch before approving.
+""".stripIndent()
+
+                    def approval = input(
+                        message: "Approval required\n\n${message}",
+                        submitter: env.RELEASE_APPROVERS,
+                        submitterParameter: 'APPROVED_BY',
+                        parameters: [choice(name: 'CONFIRM', choices: 'approve', description: 'Approve this release workflow')]
+                    )
+                    def approvedBy = approval['APPROVED_BY']
+
+                    env.APPROVED_BY = approvedBy
+                    writeFile(file: 'approvals.txt', text: "APPROVED_BY=${approvedBy}\n")
+                    archiveArtifacts artifacts: 'approvals.txt', allowEmptyArchive: false
+                }
+            }
+        }
+
+        stage('Commit And Push Branches') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.GIT_CREDENTIALS_ID,
+                    usernameVariable: 'GITEA_USER',
+                    passwordVariable: 'GITEA_TOKEN'
+                )]) {
+                    sh '''
+                        set -eu
+                        cat > git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' "$GITEA_USER" ;;
+*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
+*) printf '\n' ;;
+esac
+EOF
+                        chmod 700 git-askpass.sh
+                        export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                        export GIT_TERMINAL_PROMPT=0
+
+                        if [ "$VERSION_BUMP" = "patch" ]; then
+                            # Patch release: no source edits, no new commit. The tag will
+                            # point at the existing release branch tip already on origin.
+                            cd "$WORKSPACE/src"
+                            git status --short
+                        else
+                            cd "$WORKSPACE/release-src"
+                            git config user.name "$GIT_AUTHOR_NAME"
+                            git config user.email "$GIT_AUTHOR_EMAIL"
+                            git add sys/sys/param.h sys/conf/newvers.sh etc/Makefile.usr
+                            git commit -m "Create DragonFly $TARGET_VERSION_COMPUTED release branch"
+                            git push origin "$RELEASE_BRANCH"
+
+                            cd "$WORKSPACE/src"
+                            git config user.name "$GIT_AUTHOR_NAME"
+                            git config user.email "$GIT_AUTHOR_EMAIL"
+                            git add sys/sys/param.h sys/conf/newvers.sh
+                            git commit -m "Bump DragonFly development version to $NEXT_DEV_VERSION"
+                            git push origin "$BASE_BRANCH_NORMALIZED"
+                        fi
+                        rm -f "$WORKSPACE/git-askpass.sh"
+                    '''
+                }
+                script {
+                    env.RELEASE_COMMIT = sh(
+                        returnStdout: true,
+                        script: 'git -C "$WORKSPACE/$SIGNING_WORKTREE" rev-parse HEAD'
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Emit Signing Request') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                    {
+                        printf '{\n'
+                        printf '  "schema_version": "1",\n'
+                        printf '  "release_tag": "%s",\n' "$RELEASE_TAG"
+                        printf '  "release_branch": "%s",\n' "$RELEASE_BRANCH"
+                        printf '  "target_version": "%s",\n' "$TARGET_VERSION_COMPUTED"
+                        printf '  "release_stage": "%s",\n' "$RELEASE_STAGE"
+                        if [ "$RELEASE_STAGE" = "rc" ]; then
+                            printf '  "rc_number": "%s",\n' "$RC_NUMBER"
+                        fi
+                        printf '  "commit": "%s",\n' "$RELEASE_COMMIT"
+                        printf '  "tag_message": "%s",\n' "$RELEASE_LABEL"
+                        printf '  "origin_url": "%s",\n' "$ORIGIN_URL"
+                        printf '  "created": "%s",\n' "$created"
+                        printf '  "jenkins_build": "%s"\n' "$BUILD_TAG"
+                        printf '}\n'
+                    } > release-signing-request.json
+
+                    cat > tag-command.txt <<EOF
+# DragonFly release tag signing request
+# Tag:    $RELEASE_TAG
+# Commit: $RELEASE_COMMIT  (tip of $RELEASE_BRANCH on origin)
+#
+# Primary path (recommended): run the signing script, then push:
+#   scripts/sign-release-tag release-signing-request.json
+#   git push origin $RELEASE_TAG
+#
+# Transparent fallback (equivalent):
+#   git fetch origin $RELEASE_BRANCH
+#   git tag -s -m "$RELEASE_LABEL" $RELEASE_TAG $RELEASE_COMMIT
+#   git push origin $RELEASE_TAG
+EOF
+                '''
+                archiveArtifacts artifacts: 'release-signing-request.json,tag-command.txt', allowEmptyArchive: false
+            }
+        }
+
+        stage('Install GPG (verify)') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    if ! command -v gpg >/dev/null 2>&1; then
+                        pkg install -y gnupg
+                    fi
+                    command -v gpg >/dev/null
+                '''
+            }
+        }
+
+        stage('Await Signed Tag') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.GIT_CREDENTIALS_ID,
+                    usernameVariable: 'GITEA_USER',
+                    passwordVariable: 'GITEA_TOKEN'
+                )]) {
+                    script {
+                        echo "Waiting for an authorized signer to push signed tag ${env.RELEASE_TAG} to origin."
+                        echo "Signer inputs are archived: release-signing-request.json and tag-command.txt."
+                        timeout(time: env.SIGNED_TAG_TIMEOUT_HOURS.toInteger(), unit: 'HOURS') {
+                            waitUntil(initialRecurrencePeriod: 60000) {
+                                def present = sh(returnStatus: true, script: '''
+                                    set -eu
+                                    cat > git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' "$GITEA_USER" ;;
+*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
+*) printf '\n' ;;
+esac
+EOF
+                                    chmod 700 git-askpass.sh
+                                    export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                                    export GIT_TERMINAL_PROMPT=0
+                                    git ls-remote --exit-code --tags "$ORIGIN_URL" "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
+                                ''') == 0
+
+                                if (!present) {
+                                    echo "Signed tag ${env.RELEASE_TAG} not on origin yet; waiting..."
+                                    return false
+                                }
+
+                                // Tag is present: fetch it and verify. A present-but-invalid
+                                // tag is a hard failure, not a reason to keep waiting.
+                                sh '''
+                                    set -eu
+                                    cat > git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' "$GITEA_USER" ;;
+*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
+*) printf '\n' ;;
+esac
+EOF
+                                    chmod 700 git-askpass.sh
+                                    export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                                    export GIT_TERMINAL_PROMPT=0
+                                    cd "$WORKSPACE/src"
+                                    git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+                                '''
+
+                                def rc = sh(returnStatus: true, script: '''
+                                    set -eu
+                                    cd "$WORKSPACE/src"
+                                    AUTHORIZED_SIGNERS_DIR="$WORKSPACE/tools/keys/authorized-signers" \
+                                        "$WORKSPACE/tools/scripts/verify-release-tag" \
+                                        "$WORKSPACE/release-signing-request.json"
+                                ''')
+                                if (rc != 0) {
+                                    error("Signed tag ${env.RELEASE_TAG} is present on origin but failed verification against the authorized-signers allowlist. Refusing to proceed. (If keys/authorized-signers is empty, commit an authorized public key first.)")
+                                }
+                                echo "Signed tag ${env.RELEASE_TAG} verified against ${env.RELEASE_COMMIT}."
+                                return true
+                            }
+                        }
+                        sh 'rm -f "$WORKSPACE/git-askpass.sh"'
+                    }
+                }
+            }
+        }
+
+        stage('Dry Run Summary') {
+            when {
+                expression { return params.DRY_RUN }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    printf 'DRY_RUN=true: no commits, branch pushes, or signing request were performed.\n'
+                    printf 'On a real run, after pushing branches the pipeline would emit a signing\n'
+                    printf 'request for tag %s (label "%s") and wait for an authorized signer to push\n' "$RELEASE_TAG" "$RELEASE_LABEL"
+                    printf 'the signed tag, then verify it against keys/authorized-signers.\n'
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'rm -f git-askpass.sh src/../git-askpass.sh || true'
+            cleanWs(cleanWhenNotBuilt: false, deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+        }
+    }
+}

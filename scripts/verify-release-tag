@@ -1,0 +1,76 @@
+#!/bin/sh
+# verify-release-tag - verify a signed DragonFly release tag against its request.
+#
+# Usage: verify-release-tag release-signing-request.json
+#
+# Run by Jenkins (or anyone) before pushing/publishing a tag produced by an
+# external signer. Fails closed: an invalid signature, a tag pointing at the
+# wrong commit, or a signer outside the authorized set must all reject.
+#
+# The authorized set is the public keys committed under
+# keys/authorized-signers/*.asc (relative to this script). Override the
+# location with AUTHORIZED_SIGNERS_DIR. Public keys are not secret.
+#
+# Skeleton: minimal, sed-based JSON parsing (no jq/python dependency).
+
+set -eu
+
+die() { echo "verify-release-tag: $*" >&2; exit 1; }
+
+json_get() {
+    # $1 = file, $2 = key
+    sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n1
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+keys_dir=${AUTHORIZED_SIGNERS_DIR:-"$script_dir/../keys/authorized-signers"}
+
+[ $# -eq 1 ] || die "usage: verify-release-tag release-signing-request.json"
+request="$1"
+[ -f "$request" ] || die "request file not found: $request"
+
+release_tag=$(json_get "$request" release_tag)
+commit=$(json_get "$request" commit)
+
+[ -n "$release_tag" ] || die "release_tag missing from request"
+[ -n "$commit" ] || die "commit missing from request"
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "not inside a git working tree"
+git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null \
+    || die "tag not present: $release_tag (fetch it first)"
+
+# Build a temporary keyring containing only the authorized signer public keys.
+[ -d "$keys_dir" ] || die "authorized signers dir not found: $keys_dir"
+set -- "$keys_dir"/*.asc
+[ -e "$1" ] || die "no authorized signer keys in $keys_dir (failing closed)"
+
+tmp_gnupg=$(mktemp -d)
+trap 'rm -rf "$tmp_gnupg"' EXIT INT TERM
+chmod 700 "$tmp_gnupg"
+GNUPGHOME="$tmp_gnupg"; export GNUPGHOME
+for key in "$@"; do
+    gpg --batch --quiet --import "$key" 2>/dev/null || die "failed to import key: $key"
+done
+
+# Allowed = primary key fingerprints present in the keyring.
+allowed=$(gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/ { print $10 }' | sort -u)
+[ -n "$allowed" ] || die "authorized keyring is empty after import (failing closed)"
+
+# 1. Signature must be valid (verified against the authorized keyring only).
+status=$(git verify-tag --raw "$release_tag" 2>&1) \
+    || die "tag signature did not verify against authorized keys: $release_tag"
+
+# 2. Signing key must be one of the authorized primary keys. The VALIDSIG
+#    status line's last field is the primary key fingerprint.
+signer_fpr=$(printf '%s\n' "$status" | awk '/VALIDSIG/ { print $NF; exit }')
+[ -n "$signer_fpr" ] || die "could not determine signing key fingerprint for $release_tag"
+echo "$allowed" | grep -Fxq "$signer_fpr" \
+    || die "tag signed by unauthorized key $signer_fpr"
+
+# 3. Tag must point at the exact commit the request named.
+actual=$(git rev-parse "$release_tag^{commit}")
+[ "$actual" = "$commit" ] \
+    || die "tag $release_tag points at $actual, expected $commit"
+
+echo "OK: $release_tag verified (signer $signer_fpr) against $commit"

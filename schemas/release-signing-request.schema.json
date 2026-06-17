@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/DragonFlyBSD/cicd/schemas/release-signing-request.schema.json",
+  "title": "DragonFly release signing request",
+  "description": "Request emitted by the release pipeline for an external/human signer to produce a signed release tag.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release_tag",
+    "release_branch",
+    "target_version",
+    "release_stage",
+    "commit",
+    "tag_message"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Schema version of this request document.",
+      "const": "1"
+    },
+    "release_tag": {
+      "description": "Tag to create, e.g. v6.6.0 or v6.6.0rc1.",
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(rc[0-9]+)?$"
+    },
+    "release_branch": {
+      "description": "Release branch the tag is cut from, e.g. DragonFly_RELEASE_6_6.",
+      "type": "string",
+      "pattern": "^DragonFly_RELEASE_[0-9]+_[0-9]+$"
+    },
+    "target_version": {
+      "description": "Release version MAJOR.MINOR.PATCH.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "release_stage": {
+      "description": "Whether this is a release candidate or a final release.",
+      "enum": ["rc", "final"]
+    },
+    "rc_number": {
+      "description": "RC sequence number; only meaningful when release_stage is rc.",
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "commit": {
+      "description": "Full 40-hex commit object id the tag must point to.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "tag_message": {
+      "description": "Annotated tag message / release label.",
+      "type": "string",
+      "minLength": 1
+    },
+    "origin_url": {
+      "description": "Origin the release is being cut against.",
+      "type": "string"
+    },
+    "created": {
+      "description": "ISO-8601 timestamp when the request was generated.",
+      "type": "string"
+    },
+    "jenkins_build": {
+      "description": "Jenkins build identifier that produced this request.",
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "release_stage": { "const": "rc" } }
+      },
+      "then": {
+        "required": ["rc_number"]
+      }
+    }
+  ]
+}

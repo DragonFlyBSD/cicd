@@ -1,0 +1,86 @@
+#!/bin/sh
+# verify-release-artifacts - verify a signed sha256 manifest and its artifacts.
+#
+# Usage: verify-release-artifacts -C <dir> [CHECKSUM] [CHECKSUM.asc]
+#
+# Run by Jenkins before publishing. Verifies the CHECKSUM signature against the
+# authorized signer keys, then recomputes every hash in CHECKSUM and compares.
+# Fails closed on a bad signature, an unauthorized signer, a missing artifact,
+# or any hash mismatch.
+#
+# Authorized set = public keys committed under keys/authorized-signers/*.asc
+# (override with AUTHORIZED_SIGNERS_DIR). Public keys are not secret.
+#
+# Skeleton: deliberately minimal. Artifact builds are not implemented yet.
+
+set -eu
+
+die() { echo "verify-release-artifacts: $*" >&2; exit 1; }
+
+sha256_of_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v sha256 >/dev/null 2>&1; then
+        sha256 -q "$1"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "no sha256 tool found (sha256sum/sha256/shasum)"
+    fi
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+keys_dir=${AUTHORIZED_SIGNERS_DIR:-"$script_dir/../keys/authorized-signers"}
+
+dir=.
+while getopts C: opt; do
+    case "$opt" in
+        C) dir=$OPTARG ;;
+        *) die "usage: verify-release-artifacts -C <dir> [CHECKSUM] [CHECKSUM.asc]" ;;
+    esac
+done
+shift $((OPTIND - 1))
+manifest=${1:-CHECKSUM}
+signature=${2:-CHECKSUM.asc}
+
+[ -d "$dir" ] || die "directory not found: $dir"
+cd "$dir"
+[ -f "$manifest" ] || die "manifest not found: $manifest"
+[ -f "$signature" ] || die "signature not found: $signature"
+
+# Build a temporary keyring containing only the authorized signer public keys.
+[ -d "$keys_dir" ] || die "authorized signers dir not found: $keys_dir"
+set -- "$keys_dir"/*.asc
+[ -e "$1" ] || die "no authorized signer keys in $keys_dir (failing closed)"
+
+tmp_gnupg=$(mktemp -d)
+trap 'rm -rf "$tmp_gnupg"' EXIT INT TERM
+chmod 700 "$tmp_gnupg"
+GNUPGHOME="$tmp_gnupg"; export GNUPGHOME
+for key in "$@"; do
+    gpg --batch --quiet --import "$key" 2>/dev/null || die "failed to import key: $key"
+done
+allowed=$(gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/ { print $10 }' | sort -u)
+[ -n "$allowed" ] || die "authorized keyring is empty after import (failing closed)"
+
+# 1. Manifest signature must be valid and from an authorized key.
+status=$(gpg --batch --status-fd 1 --verify "$signature" "$manifest" 2>/dev/null) \
+    || die "manifest signature did not verify: $signature"
+signer_fpr=$(printf '%s\n' "$status" | awk '/VALIDSIG/ { print $NF; exit }')
+[ -n "$signer_fpr" ] || die "could not determine signing key fingerprint"
+echo "$allowed" | grep -Fxq "$signer_fpr" \
+    || die "manifest signed by unauthorized key $signer_fpr"
+
+# 2. Every artifact listed in the manifest must exist and match its hash.
+#    Manifest lines are GNU coreutils format: "<hex>  <path>".
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    want=${line%% *}
+    file=${line#* }
+    file=${file# }
+    [ -f "$file" ] || die "artifact listed in manifest is missing: $file"
+    got=$(sha256_of_file "$file")
+    [ "$got" = "$want" ] || die "hash mismatch for $file (want $want, got $got)"
+done < "$manifest"
+
+echo "OK: manifest verified (signer $signer_fpr), all artifacts match"
