@@ -1,0 +1,54 @@
+#!/bin/sh
+# sign-release-artifacts - produce a signed sha256 manifest for release artifacts.
+#
+# Usage: sign-release-artifacts -C <dir> <file> [file...]
+#
+# Builds a CHECKSUM manifest (sha256 of each artifact, GNU coreutils format) and
+# signs it once with the signer's own key, producing CHECKSUM.asc. The single
+# signature transitively covers every artifact via its hash. Run by an
+# authorized signer off the Jenkins host.
+#
+# Skeleton: deliberately minimal. Artifact builds are not implemented yet.
+
+set -eu
+
+die() { echo "sign-release-artifacts: $*" >&2; exit 1; }
+
+# Portable sha256 -> emit just the hex digest for a file.
+sha256_of_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v sha256 >/dev/null 2>&1; then
+        sha256 -q "$1"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "no sha256 tool found (sha256sum/sha256/shasum)"
+    fi
+}
+
+dir=.
+while getopts C: opt; do
+    case "$opt" in
+        C) dir=$OPTARG ;;
+        *) die "usage: sign-release-artifacts -C <dir> <file> [file...]" ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || die "usage: sign-release-artifacts -C <dir> <file> [file...]"
+[ -d "$dir" ] || die "directory not found: $dir"
+
+cd "$dir"
+[ -e CHECKSUM.asc ] && die "CHECKSUM.asc already exists in $dir"
+
+: > CHECKSUM
+for f in "$@"; do
+    [ -f "$f" ] || die "artifact not found: $f"
+    printf '%s  %s\n' "$(sha256_of_file "$f")" "$f" >> CHECKSUM
+done
+
+# Detached, armored signature with the signer's own default key.
+gpg --armor --detach-sign --output CHECKSUM.asc CHECKSUM
+
+echo "Wrote CHECKSUM and CHECKSUM.asc in $dir for $# artifact(s)"
+cat CHECKSUM
