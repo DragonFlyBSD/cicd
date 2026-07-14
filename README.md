@@ -14,6 +14,8 @@ of the DragonFly repo for testing, not the canonical repository.
 jenkins/
   Jenkinsfile.release-git              Release Git-workflow pipeline (derived
                                        from the release-rehearsal pipeline).
+  active-choices/                      Reference copies of the Active Choices
+                                       parameter scripts (BASE_BRANCH).
 docs/
   release-pipeline.md                  Design/plan for the release pipeline.
   signing.md                           Release signing model and known keys.
