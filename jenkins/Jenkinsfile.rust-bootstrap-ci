@@ -1,0 +1,120 @@
+// PR CI for DragonFlyBSD/rust-bootstrap-dragonfly.
+//
+// This Jenkinsfile lives in the DragonFlyBSD/cicd repo, NOT in the
+// rust-bootstrap-dragonfly repo. A Multibranch Pipeline job scans
+// rust-bootstrap-dragonfly for pull requests (GitHub Branch Source) and, via
+// the Remote Jenkinsfile Provider plugin (mode "by Remote Jenkins File
+// Plugin"), pulls THIS file from cicd as its pipeline definition. PR discovery
+// and the pass/fail status reported back onto the PR still come from the
+// scanned rust repo; only the pipeline text is sourced here. See
+// docs/rust-bootstrap-ci.md for the one-time job setup.
+//
+// The implicit `checkout scm` performed by declarative pipeline checks out the
+// PR's rust-bootstrap-dragonfly source (the branch source), which is what we
+// build. On each PR this pipeline works out which per-version bootstrap
+// directory the PR touched and runs that version's build.sh end-to-end (a full
+// Rust + LLVM bootstrap). Building every version on every PR is infeasible --
+// each build is multi-hour -- so only the changed version dir(s) are built.
+
+// The one knob to confirm for your infra: the agent label of the DragonFly
+// build node(s). Matches the label style used by Jenkinsfile.release-git.
+def NODE_LABEL = 'dragonflybsd-nvmm large'
+def BUILD_TIMEOUT_HOURS = 8
+
+pipeline {
+    agent { label "${NODE_LABEL}" }
+
+    options {
+        timestamps()
+        // A new commit on the PR cancels the in-flight build for that PR.
+        disableConcurrentBuilds(abortPrevious: true)
+        timeout(time: BUILD_TIMEOUT_HOURS, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    stages {
+        stage('Detect Changed Versions') {
+            steps {
+                script {
+                    // On a PR build CHANGE_TARGET is the base branch (e.g.
+                    // master). On a plain branch build fall back to the branch's
+                    // own name so the job still behaves sanely.
+                    String target = env.CHANGE_TARGET ?: env.BRANCH_NAME ?: 'master'
+
+                    // Ensure the base branch is present locally to diff against.
+                    sh """
+                        set -eu
+                        git fetch --no-tags origin '+refs/heads/${target}:refs/remotes/origin/${target}' || true
+                    """
+
+                    String changed = sh(
+                        returnStdout: true,
+                        script: """
+                            set -eu
+                            base=\$(git merge-base HEAD 'origin/${target}' 2>/dev/null || echo '')
+                            if [ -n "\$base" ]; then
+                                git diff --name-only "\$base" HEAD
+                            else
+                                git diff --name-only 'origin/${target}' HEAD
+                            fi
+                        """
+                    ).trim()
+
+                    def versions = [] as LinkedHashSet
+                    changed.readLines().each { line ->
+                        def m = line =~ /^(\d+\.\d+\.\d+)\//
+                        if (m) { versions << m.group(1) }
+                    }
+                    // Keep only dirs that actually have a build.sh in this
+                    // checkout (guards a PR that only deletes/renames a version).
+                    def buildable = versions.findAll { v -> fileExists("${v}/build.sh") }.sort()
+                    env.CHANGED_VERSIONS = buildable.join(' ')
+
+                    if (buildable.isEmpty()) {
+                        echo 'No per-version bootstrap directory changed in this PR.'
+                        boolean sharedTouched = changed.readLines().any {
+                            it in ['common.sh', 'checksums.sh'] || it.startsWith('bin/')
+                        }
+                        if (sharedTouched) {
+                            echo 'Shared build files (common.sh / checksums.sh / bin/) changed. ' +
+                                 'These affect every version; this job does not auto-build all of them. ' +
+                                 'Run a targeted build for the affected versions manually.'
+                        }
+                        echo 'Nothing to build; passing.'
+                    } else {
+                        echo "Will build: ${env.CHANGED_VERSIONS}"
+                    }
+                }
+            }
+        }
+
+        stage('Build Changed Versions') {
+            when {
+                expression { return env.CHANGED_VERSIONS?.trim() }
+            }
+            steps {
+                script {
+                    env.CHANGED_VERSIONS.trim().split(/\s+/).each { v ->
+                        stage("Build ${v}") {
+                            // build.sh installs the toolchain into the DEST arg
+                            // and streams progress to the console (captured by
+                            // Jenkins, so it shows in the PR check's log).
+                            sh """
+                                set -eu
+                                rm -rf "\$WORKSPACE/build-${v}"
+                                cd '${v}'
+                                ./build.sh "\$WORKSPACE/build-${v}"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs(deleteDirs: true, notFailBuild: true, disableDeferredWipeout: true)
+        }
+    }
+}
