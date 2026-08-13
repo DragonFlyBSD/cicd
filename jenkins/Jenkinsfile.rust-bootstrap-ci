@@ -9,23 +9,32 @@
 // scanned rust repo; only the pipeline text is sourced here. See
 // docs/rust-bootstrap-ci.md for the one-time job setup.
 //
-// The implicit `checkout scm` performed by declarative pipeline checks out the
-// PR's rust-bootstrap-dragonfly source (the branch source), which is what we
-// build. On each PR this pipeline works out which per-version bootstrap
-// directory the PR touched and runs that version's build.sh end-to-end (a full
-// Rust + LLVM bootstrap). Building every version on every PR is infeasible --
-// each build is multi-hour -- so only the changed version dir(s) are built.
+// IMPORTANT: because the Jenkinsfile is loaded via Remote Jenkinsfile Provider,
+// the pipeline's `scm` variable is bound to THIS cicd repo, not to the scanned
+// rust repo. So the implicit declarative checkout is skipped
+// (skipDefaultCheckout) and the rust PR source is checked out explicitly below.
+// The rust repo is public, so the clone needs no credentials; the GitHub App
+// credential on the job is only for PR discovery and status reporting.
+//
+// On each PR this pipeline works out which per-version bootstrap directory the
+// PR touched and runs that version's build.sh end-to-end (a full Rust + LLVM
+// bootstrap). Building every version on every PR is infeasible -- each build is
+// multi-hour -- so only the changed version dir(s) are built.
 
 // The one knob to confirm for your infra: the agent label of the DragonFly
 // build node(s). Matches the label style used by Jenkinsfile.release-git.
 def NODE_LABEL = 'dragonflybsd-nvmm large'
 def BUILD_TIMEOUT_HOURS = 8
+def RUST_REPO_URL = 'https://github.com/DragonFlyBSD/rust-bootstrap-dragonfly.git'
 
 pipeline {
     agent { label "${NODE_LABEL}" }
 
     options {
         timestamps()
+        // The Jenkinsfile comes from cicd, so the implicit `checkout scm` would
+        // check out cicd, not the rust PR. Skip it; we check out rust below.
+        skipDefaultCheckout(true)
         // A new commit on the PR cancels the in-flight build for that PR.
         disableConcurrentBuilds(abortPrevious: true)
         timeout(time: BUILD_TIMEOUT_HOURS, unit: 'HOURS')
@@ -33,31 +42,61 @@ pipeline {
     }
 
     stages {
-        stage('Detect Changed Versions') {
+        stage('Checkout Source') {
             steps {
                 script {
                     // On a PR build CHANGE_TARGET is the base branch (e.g.
-                    // master). On a plain branch build fall back to the branch's
-                    // own name so the job still behaves sanely.
+                    // master); on a branch build fall back to the branch name.
                     String target = env.CHANGE_TARGET ?: env.BRANCH_NAME ?: 'master'
+                    env.DIFF_TARGET = target
 
-                    // Ensure the base branch is present locally to diff against.
-                    sh """
-                        set -eu
-                        git fetch --no-tags origin '+refs/heads/${target}:refs/remotes/origin/${target}' || true
-                    """
+                    if (env.CHANGE_ID) {
+                        // PR build. GitHub exposes every PR -- including from
+                        // forks -- under the base repo's refs/pull/<id>/head, so
+                        // this one URL covers origin and fork PRs. Fetch the PR
+                        // head and the base branch (needed for the diff).
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "refs/remotes/origin/PR-${env.CHANGE_ID}"]],
+                            userRemoteConfigs: [[
+                                url: RUST_REPO_URL,
+                                refspec: "+refs/pull/${env.CHANGE_ID}/head:refs/remotes/origin/PR-${env.CHANGE_ID} +refs/heads/${target}:refs/remotes/origin/${target}"
+                            ]],
+                            extensions: [[$class: 'CleanBeforeCheckout']]
+                        ])
+                    } else {
+                        // Branch/push build.
+                        String branch = env.BRANCH_NAME ?: 'master'
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "refs/remotes/origin/${branch}"]],
+                            userRemoteConfigs: [[
+                                url: RUST_REPO_URL,
+                                refspec: "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+                            ]],
+                            extensions: [[$class: 'CleanBeforeCheckout']]
+                        ])
+                    }
+                }
+            }
+        }
 
+        stage('Detect Changed Versions') {
+            steps {
+                script {
+                    // Diff the checked-out HEAD (PR head) against the base branch.
                     String changed = sh(
                         returnStdout: true,
-                        script: """
+                        script: '''
                             set -eu
-                            base=\$(git merge-base HEAD 'origin/${target}' 2>/dev/null || echo '')
-                            if [ -n "\$base" ]; then
-                                git diff --name-only "\$base" HEAD
-                            else
-                                git diff --name-only 'origin/${target}' HEAD
+                            target="origin/${DIFF_TARGET}"
+                            if git rev-parse --verify -q "$target" >/dev/null; then
+                                base=$(git merge-base HEAD "$target" 2>/dev/null || echo "")
+                                if [ -n "$base" ]; then
+                                    git diff --name-only "$base" HEAD
+                                fi
                             fi
-                        """
+                        '''
                     ).trim()
 
                     def versions = [] as LinkedHashSet
@@ -71,7 +110,7 @@ pipeline {
                     env.CHANGED_VERSIONS = buildable.join(' ')
 
                     if (buildable.isEmpty()) {
-                        echo 'No per-version bootstrap directory changed in this PR.'
+                        echo 'No per-version bootstrap directory changed in this PR. Nothing to build; passing.'
                         boolean sharedTouched = changed.readLines().any {
                             it in ['common.sh', 'checksums.sh'] || it.startsWith('bin/')
                         }
@@ -80,7 +119,6 @@ pipeline {
                                  'These affect every version; this job does not auto-build all of them. ' +
                                  'Run a targeted build for the affected versions manually.'
                         }
-                        echo 'Nothing to build; passing.'
                     } else {
                         echo "Will build: ${env.CHANGED_VERSIONS}"
                     }

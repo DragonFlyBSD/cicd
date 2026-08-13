@@ -20,10 +20,12 @@ that repo**. The pipeline definition lives here in `cicd`
   its pipeline text from **this `cicd` repo** instead of from the scanned repo.
   So `rust-bootstrap-dragonfly` stays untouched and `cicd` is the single source
   of truth for the CI logic.
-- When a PR build runs, the pipeline's implicit `checkout scm` checks out the
-  **PR's `rust-bootstrap-dragonfly` source** (the branch source), diffs it
-  against the base branch to find which per-version directory changed, and runs
-  that version's `build.sh` end-to-end (a full Rust + LLVM bootstrap).
+- When a PR build runs, the pipeline **explicitly checks out the PR's
+  `rust-bootstrap-dragonfly` source** (via `refs/pull/<id>/head`, which covers
+  fork PRs too), diffs it against the base branch to find which per-version
+  directory changed, and runs that version's `build.sh` end-to-end (a full
+  Rust + LLVM bootstrap). It does *not* use the implicit `checkout scm` — see
+  the caveat below.
 
 ### Why only the changed version is built
 
@@ -83,10 +85,14 @@ Both knobs are near the top of `jenkins/Jenkinsfile.rust-bootstrap-ci`:
 
 ## Notes / caveats
 
-- **`checkout scm` targets the scanned repo.** Under Remote Jenkinsfile
-  Provider, the injected Jenkinsfile comes from `cicd` while the implicit
-  declarative checkout still pulls the `rust-bootstrap-dragonfly` PR source —
-  which is what the build compiles. Do not add an explicit checkout of `cicd`.
+- **`checkout scm` points at `cicd`, not the rust repo.** Under Remote
+  Jenkinsfile Provider the pipeline's `scm` variable is bound to the repo the
+  Jenkinsfile came from (`cicd`), because the plugin wraps a
+  `CpsScmFlowDefinition` around the remote SCM. So the pipeline sets
+  `skipDefaultCheckout(true)` and checks out `rust-bootstrap-dragonfly`
+  explicitly (PR head via `refs/pull/<id>/head`). Do **not** rely on
+  `checkout scm` here — it would give you the `cicd` tree and the version diff
+  would always come up empty.
 - **Build dependencies** (llvm, gcc7, python, cmake, libssh, perl) must be
   present on the build node — see the rust repo's README. Worker provisioning
   is out of scope here.
