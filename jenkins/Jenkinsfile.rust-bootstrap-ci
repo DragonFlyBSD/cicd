@@ -1,41 +1,56 @@
-// PR CI for DragonFlyBSD/rust-bootstrap-dragonfly.
+// PR CI + bootstrap publishing for DragonFlyBSD/rust-bootstrap-dragonfly.
 //
 // This Jenkinsfile lives in the DragonFlyBSD/cicd repo, NOT in the
 // rust-bootstrap-dragonfly repo. A Multibranch Pipeline job scans
 // rust-bootstrap-dragonfly for pull requests (GitHub Branch Source) and, via
-// the Remote Jenkinsfile Provider plugin (mode "by Remote Jenkins File
-// Plugin"), pulls THIS file from cicd as its pipeline definition. PR discovery
-// and the pass/fail status reported back onto the PR still come from the
-// scanned rust repo; only the pipeline text is sourced here. See
-// docs/rust-bootstrap-ci.md for the one-time job setup.
+// the Remote Jenkinsfile Provider plugin, pulls THIS file from cicd as its
+// pipeline definition. See docs/rust-bootstrap-ci.md for the one-time setup.
 //
-// IMPORTANT: because the Jenkinsfile is loaded via Remote Jenkinsfile Provider,
-// the pipeline's `scm` variable is bound to THIS cicd repo, not to the scanned
-// rust repo. So the implicit declarative checkout is skipped
-// (skipDefaultCheckout) and the rust PR source is checked out explicitly below.
-// The rust repo is public, so the clone needs no credentials; the GitHub App
-// credential on the job is only for PR discovery and status reporting.
+// Two modes, one job:
+//   * Normal PR / branch run (PUBLISH_VERSION empty): diff against the base
+//     branch, build the changed per-version bootstrap dir(s), report status.
+//     Never publishes.
+//   * Manual publish run: on the master branch, "Build with Parameters" with
+//     PUBLISH_VERSION set (e.g. 1.86.0) rebuilds THAT version and rsync-
+//     publishes its DragonFly bootstrap artifacts to the archive. This is how
+//     an already-released version's artifacts are (re)generated so the next
+//     version can bootstrap from it. Publishing is refused on PR builds.
 //
-// On each PR this pipeline works out which per-version bootstrap directory the
-// PR touched and runs that version's build.sh end-to-end (a full Rust + LLVM
-// bootstrap). Building every version on every PR is infeasible -- each build is
-// multi-hour -- so only the changed version dir(s) are built.
+// IMPORTANT: the Jenkinsfile is loaded via Remote Jenkinsfile Provider, so the
+// pipeline's `scm` variable is bound to cicd, not the scanned rust repo. The
+// implicit declarative checkout is skipped (skipDefaultCheckout) and the rust
+// source is checked out explicitly below. The rust repo is public, so its clone
+// needs no credentials; credentials are used only for publishing.
+//
+// Publish target/credentials are NOT committed here (this is a public repo).
+// They must be set on the Jenkins job, and the pipeline fails closed if a
+// publish is requested while they are unset:
+//   RUST_BOOTSTRAP_RSYNC_DEST : rsync-daemon dest, host/module/path with no
+//                               scheme or user, e.g. host/assets-upload/rust
+//   RSYNC_CREDENTIALS_ID      : id of a username/password credential for the
+//                               rsync daemon (password read via RSYNC_PASSWORD)
 
-// The one knob to confirm for your infra: the agent label of the DragonFly
-// build node(s). Matches the label style used by Jenkinsfile.release-git.
 def NODE_LABEL = 'dragonflybsd-nvmm large'
 def BUILD_TIMEOUT_HOURS = 8
 def RUST_REPO_URL = 'https://github.com/DragonFlyBSD/rust-bootstrap-dragonfly.git'
+def RUST_TARGET = 'x86_64-unknown-dragonfly'
 
 pipeline {
     agent { label "${NODE_LABEL}" }
 
+    parameters {
+        string(
+            name: 'PUBLISH_VERSION',
+            defaultValue: '',
+            description: 'Leave EMPTY for normal PR/branch verification. Set to a version (e.g. 1.86.0) on the master branch to rebuild that version and publish its DragonFly bootstrap artifacts. Ignored on PR builds.'
+        )
+    }
+
     options {
         timestamps()
         // The Jenkinsfile comes from cicd, so the implicit `checkout scm` would
-        // check out cicd, not the rust PR. Skip it; we check out rust below.
+        // check out cicd, not the rust source. Skip it; we check out rust below.
         skipDefaultCheckout(true)
-        // A new commit on the PR cancels the in-flight build for that PR.
         disableConcurrentBuilds(abortPrevious: true)
         timeout(time: BUILD_TIMEOUT_HOURS, unit: 'HOURS')
         buildDiscarder(logRotator(numToKeepStr: '20'))
@@ -52,9 +67,7 @@ pipeline {
 
                     if (env.CHANGE_ID) {
                         // PR build. GitHub exposes every PR -- including from
-                        // forks -- under the base repo's refs/pull/<id>/head, so
-                        // this one URL covers origin and fork PRs. Fetch the PR
-                        // head and the base branch (needed for the diff).
+                        // forks -- under the base repo's refs/pull/<id>/head.
                         checkout([
                             $class: 'GitSCM',
                             branches: [[name: "refs/remotes/origin/PR-${env.CHANGE_ID}"]],
@@ -65,7 +78,7 @@ pipeline {
                             extensions: [[$class: 'CleanBeforeCheckout']]
                         ])
                     } else {
-                        // Branch/push build.
+                        // Branch/push build (incl. a manual master publish run).
                         String branch = env.BRANCH_NAME ?: 'master'
                         checkout([
                             $class: 'GitSCM',
@@ -81,62 +94,98 @@ pipeline {
             }
         }
 
-        stage('Detect Changed Versions') {
+        stage('Determine Build Set') {
             steps {
                 script {
-                    // Diff the checked-out HEAD (PR head) against the base branch.
-                    String changed = sh(
-                        returnStdout: true,
-                        script: '''
-                            set -eu
-                            target="origin/${DIFF_TARGET}"
-                            if git rev-parse --verify -q "$target" >/dev/null; then
-                                base=$(git merge-base HEAD "$target" 2>/dev/null || echo "")
-                                if [ -n "$base" ]; then
-                                    git diff --name-only "$base" HEAD
-                                fi
-                            fi
-                        '''
-                    ).trim()
+                    String publishVersion = params.PUBLISH_VERSION?.trim() ?: ''
+                    // Publishing is only ever allowed on a non-PR (trusted) run.
+                    boolean publishRequested = publishVersion && !env.CHANGE_ID
 
-                    def versions = [] as LinkedHashSet
-                    changed.readLines().each { line ->
-                        def m = line =~ /^(\d+\.\d+\.\d+)\//
-                        if (m) { versions << m.group(1) }
+                    if (publishVersion && env.CHANGE_ID) {
+                        error("PUBLISH_VERSION is set on a PR build (#${env.CHANGE_ID}). Publishing is refused on PR builds; trigger it on the master branch instead.")
                     }
-                    // Keep only dirs that actually have a build.sh in this
-                    // checkout (guards a PR that only deletes/renames a version).
-                    def buildable = versions.findAll { v -> fileExists("${v}/build.sh") }.sort()
-                    env.CHANGED_VERSIONS = buildable.join(' ')
 
-                    if (buildable.isEmpty()) {
-                        echo 'No per-version bootstrap directory changed in this PR. Nothing to build; passing.'
-                        boolean sharedTouched = changed.readLines().any {
-                            it in ['common.sh', 'checksums.sh'] || it.startsWith('bin/')
+                    if (publishRequested) {
+                        if (!(publishVersion ==~ /^\d+\.\d+\.\d+$/)) {
+                            error("Invalid PUBLISH_VERSION '${publishVersion}'. Expected MAJOR.MINOR.PATCH, e.g. 1.86.0")
                         }
-                        if (sharedTouched) {
-                            echo 'Shared build files (common.sh / checksums.sh / bin/) changed. ' +
-                                 'These affect every version; this job does not auto-build all of them. ' +
-                                 'Run a targeted build for the affected versions manually.'
+                        if (!fileExists("${publishVersion}/build.sh")) {
+                            error("No ${publishVersion}/build.sh in the checkout; nothing to build/publish.")
                         }
+                        env.BUILD_VERSIONS = publishVersion
+                        env.DO_PUBLISH = 'true'
+                        echo "Publish run: will build and publish ${publishVersion}."
                     } else {
-                        echo "Will build: ${env.CHANGED_VERSIONS}"
+                        env.DO_PUBLISH = 'false'
+                        // Diff the checked-out HEAD against the base branch.
+                        String changed = sh(
+                            returnStdout: true,
+                            script: '''
+                                set -eu
+                                target="origin/${DIFF_TARGET}"
+                                if git rev-parse --verify -q "$target" >/dev/null; then
+                                    base=$(git merge-base HEAD "$target" 2>/dev/null || echo "")
+                                    if [ -n "$base" ]; then
+                                        git diff --name-only "$base" HEAD
+                                    fi
+                                fi
+                            '''
+                        ).trim()
+
+                        def versions = [] as LinkedHashSet
+                        changed.readLines().each { line ->
+                            def m = line =~ /^(\d+\.\d+\.\d+)\//
+                            if (m) { versions << m.group(1) }
+                        }
+                        def buildable = versions.findAll { v -> fileExists("${v}/build.sh") }.sort()
+                        env.BUILD_VERSIONS = buildable.join(' ')
+
+                        if (buildable.isEmpty()) {
+                            echo 'No per-version bootstrap directory changed. Nothing to build; passing.'
+                            boolean sharedTouched = changed.readLines().any {
+                                it in ['common.sh', 'checksums.sh'] || it.startsWith('bin/')
+                            }
+                            if (sharedTouched) {
+                                echo 'Shared build files (common.sh / checksums.sh / bin/) changed. ' +
+                                     'These affect every version; this job does not auto-build all of them.'
+                            }
+                        } else {
+                            echo "Will build: ${env.BUILD_VERSIONS}"
+                        }
                     }
                 }
             }
         }
 
-        stage('Build Changed Versions') {
+        stage('Validate Publish Config') {
+            // Fail fast, before the multi-hour build, if a publish was requested
+            // but the target/credentials are not configured on the Jenkins job.
             when {
-                expression { return env.CHANGED_VERSIONS?.trim() }
+                expression { return env.DO_PUBLISH == 'true' }
             }
             steps {
                 script {
-                    env.CHANGED_VERSIONS.trim().split(/\s+/).each { v ->
+                    if (!env.RUST_BOOTSTRAP_RSYNC_DEST?.trim()) {
+                        error('RUST_BOOTSTRAP_RSYNC_DEST must be configured on the Jenkins job to publish (host/module/path of the rsync daemon dest).')
+                    }
+                    if (!env.RSYNC_CREDENTIALS_ID?.trim()) {
+                        error('RSYNC_CREDENTIALS_ID must be configured on the Jenkins job to publish (username/password credential for the rsync daemon).')
+                    }
+                }
+            }
+        }
+
+        stage('Build') {
+            when {
+                expression { return env.BUILD_VERSIONS?.trim() }
+            }
+            steps {
+                script {
+                    env.BUILD_VERSIONS.trim().split(/\s+/).each { v ->
                         stage("Build ${v}") {
-                            // build.sh installs the toolchain into the DEST arg
-                            // and streams progress to the console (captured by
-                            // Jenkins, so it shows in the PR check's log).
+                            // build.sh runs through xdist, producing the dist
+                            // tarballs, then installs. Output streams to the
+                            // console (captured by Jenkins, shown on the check).
                             sh """
                                 set -eu
                                 rm -rf "\$WORKSPACE/build-${v}"
@@ -145,6 +194,68 @@ pipeline {
                             """
                         }
                     }
+                }
+            }
+        }
+
+        stage('Publish Bootstrap') {
+            when {
+                expression { return env.DO_PUBLISH == 'true' }
+            }
+            steps {
+                script {
+                    // Defense in depth: never publish from a PR build.
+                    if (env.CHANGE_ID) {
+                        error('Refusing to publish from a PR build.')
+                    }
+                    String v = params.PUBLISH_VERSION.trim()
+                    // Collect the three DragonFly bootstrap tarballs produced by
+                    // x.py dist (located by name, so we do not assume the exact
+                    // build/dist path), checksum them, and rsync to the archive.
+                    withEnv(["RUST_VERSION=${v}", "RUST_TARGET=${RUST_TARGET}"]) {
+                        withCredentials([usernamePassword(
+                            credentialsId: env.RSYNC_CREDENTIALS_ID,
+                            usernameVariable: 'RSYNC_USER',
+                            passwordVariable: 'RSYNC_PASSWORD'
+                        )]) {
+                            sh 'pkg install -y rsync'
+                            sh '''
+                                set -eu
+                                stage="$WORKSPACE/publish-$RUST_VERSION"
+                                rm -rf "$stage"; mkdir -p "$stage"
+                                for comp in cargo rustc rust-std; do
+                                    name="${comp}-${RUST_VERSION}-${RUST_TARGET}.tar.xz"
+                                    f=$(find "$WORKSPACE/build-$RUST_VERSION" -type f -name "$name" | head -1)
+                                    if [ -z "$f" ]; then
+                                        echo "Expected dist tarball not found: $name" >&2
+                                        exit 1
+                                    fi
+                                    cp "$f" "$stage/"
+                                done
+                                cd "$stage"
+                                for f in *.tar.xz; do
+                                    sha256 -r "$f" > "$f.sha256"
+                                done
+                                echo "Publishing $RUST_VERSION bootstrap:"
+                                ls -l "$stage"
+                                # --mkpath creates the per-version dir on the
+                                # daemon (rsync >= 3.2.3).
+                                rsync -av --mkpath *.tar.xz *.sha256 \
+                                    "rsync://${RSYNC_USER}@${RUST_BOOTSTRAP_RSYNC_DEST}/${RUST_VERSION}/"
+
+                                # Emit ready-to-paste checksums.sh lines. The key
+                                # mangling (. and - to _) matches download() in
+                                # common.sh, so the next version can bootstrap.
+                                echo "==== Add these to checksums.sh in the rust repo ===="
+                                for f in *.tar.xz; do
+                                    key=$(echo "$f" | tr '.-' '__')
+                                    echo "SHA256_${key}=$(sha256 -q "$f")"
+                                done
+                                echo "===================================================="
+                            '''
+                        }
+                    }
+                    echo "Published ${v} bootstrap artifacts. Add their sha256s to checksums.sh so the next version can bootstrap from ${v}."
                 }
             }
         }

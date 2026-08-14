@@ -3,8 +3,18 @@
 CI wiring that builds pull requests to
 [`DragonFlyBSD/rust-bootstrap-dragonfly`](https://github.com/DragonFlyBSD/rust-bootstrap-dragonfly)
 in Jenkins and reports pass/fail back onto the PR — **without adding any file to
-that repo**. The pipeline definition lives here in `cicd`
-(`jenkins/Jenkinsfile.rust-bootstrap-ci`).
+that repo**. The same job also publishes a version's DragonFly bootstrap
+artifacts on demand, so the bootstrap chain can advance. The pipeline definition
+lives here in `cicd` (`jenkins/Jenkinsfile.rust-bootstrap-ci`).
+
+The one job has two modes:
+
+- **Verify (default):** a PR/branch build diffs against the base branch, builds
+  the changed per-version dir(s), reports status. Never publishes.
+- **Publish (manual):** on the `master` branch, *Build with Parameters* with
+  `PUBLISH_VERSION` set (e.g. `1.86.0`) rebuilds that version and rsync-publishes
+  its `cargo`/`rustc`/`rust-std` bootstrap tarballs. See
+  [Publishing a bootstrap](#publishing-a-bootstrap) below.
 
 ## How it works
 
@@ -36,7 +46,49 @@ typical "Add Rust X.Y.Z bootstrap" PR changes exactly one dir.
 
 If a PR changes only shared files (`common.sh`, `checksums.sh`, `bin/`) and no
 version dir, the job passes with a note — it does not auto-build all versions.
-Build those manually / with a dedicated job when needed.
+
+## Publishing a bootstrap
+
+Each version bootstraps from the previous one: `1.87.0`'s `build.sh` downloads
+the `1.86.0` DragonFly `cargo`/`rustc`/`rust-std` tarballs (see `BOOTSTRAP_URL`
+in the rust repo's `common.sh`). So before a new version can be added, the
+previous version's artifacts must exist at that download location. They are
+produced by **rebuilding the previous version and publishing its output**.
+
+To publish version `X`:
+
+1. On the multibranch job, open the **`master`** branch and click **Build with
+   Parameters**.
+2. Set **`PUBLISH_VERSION`** to `X` (e.g. `1.86.0`) and build.
+3. The job rebuilds `X` (bootstrapping from `X-1`, which must already be
+   published) and rsync-publishes `cargo/rustc/rust-std-X-x86_64-unknown-dragonfly.tar.xz`
+   plus `.sha256` to the archive, creating the per-version dir (`--mkpath`).
+4. At the end it prints ready-to-paste `SHA256_..._tar_xz=` lines. **Add those to
+   `checksums.sh` in the rust repo** so `X+1` can bootstrap from `X`.
+
+Publishing is **refused on PR builds** (two guards) — a PR is untrusted,
+unmerged code. Only a non-PR (`master`) run with `PUBLISH_VERSION` publishes.
+
+### Publish configuration (set on the Jenkins job, not committed)
+
+Kept out of this public repo, matching the `release-git` convention; the job
+**fails closed** before the build if a publish is requested while these are
+unset:
+
+| Variable | Meaning |
+|---|---|
+| `RUST_BOOTSTRAP_RSYNC_DEST` | rsync-daemon dest `host/module[/subpath]`, no scheme/user — e.g. `avalon.dragonflybsd.org/rust`. The job builds `rsync://${RSYNC_USER}@${dest}/${version}/`. |
+| `RSYNC_CREDENTIALS_ID` | id of a username/password credential for the rsync daemon (password read via `RSYNC_PASSWORD`). |
+
+The credential username/password auth mirrors `dragonflybsd-complete`.
+
+### Migrating the bootstrap archive
+
+Old bootstraps (≤ `1.85.1`) currently live at the legacy `BOOTSTRAP_URL`; newly
+published versions go to the new dest above. During the transition **both must
+resolve** — keep `common.sh`'s `BOOTSTRAP_URL` on the legacy location until the
+new archive holds the versions you need, then flip it (or make it try new, fall
+back to old). That `BOOTSTRAP_URL` edit is a one-liner in the rust repo.
 
 ## One-time Jenkins setup
 
