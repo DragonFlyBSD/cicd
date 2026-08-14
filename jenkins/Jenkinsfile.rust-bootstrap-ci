@@ -197,11 +197,13 @@ pipeline {
                             // build.sh runs through xdist, producing the dist
                             // tarballs, then installs. Output streams to the
                             // console (captured by Jenkins, shown on the check).
+                            // Invoke via sh: build.sh is not guaranteed +x in
+                            // the checkout, and its shebang is /bin/sh anyway.
                             sh """
                                 set -eu
                                 rm -rf "\$WORKSPACE/build-${v}"
                                 cd '${v}'
-                                ./build.sh "\$WORKSPACE/build-${v}"
+                                sh ./build.sh "\$WORKSPACE/build-${v}"
                             """
                         }
                     }
