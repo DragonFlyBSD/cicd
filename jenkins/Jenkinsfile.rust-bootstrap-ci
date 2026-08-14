@@ -41,7 +41,7 @@ def RSYNC_LOGIN_CREDENTIALS_ID = 'rust-upload'
 // Packages installed on the agent before a build. Add to this list as needed;
 // the rust bootstrap's fuller deps (see the rust repo README) include e.g.
 // llvm, gcc7, python, cmake, libssh, perl.
-def BUILD_PKGS = ['cmake']
+def BUILD_PKGS = ['cmake', 'ninja']
 
 pipeline {
     agent { label "${NODE_LABEL}" }
