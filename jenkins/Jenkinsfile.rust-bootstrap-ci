@@ -32,7 +32,7 @@
 //                                (password consumed via the RSYNC_PASSWORD env)
 // A publish run fails fast if either credential id is missing on the job.
 
-def NODE_LABEL = 'dragonflybsd-nvmm large'
+def NODE_LABEL = 'dragonflybsd-nvmm xlarge'
 def BUILD_TIMEOUT_HOURS = 8
 def RUST_REPO_URL = 'https://github.com/DragonFlyBSD/rust-bootstrap-dragonfly.git'
 def RUST_TARGET = 'x86_64-unknown-dragonfly'
