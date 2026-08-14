@@ -38,6 +38,10 @@ def RUST_REPO_URL = 'https://github.com/DragonFlyBSD/rust-bootstrap-dragonfly.gi
 def RUST_TARGET = 'x86_64-unknown-dragonfly'
 def RSYNC_DEST_CREDENTIALS_ID = 'rust-bootstrap-rsync-dest'
 def RSYNC_LOGIN_CREDENTIALS_ID = 'rust-upload'
+// Packages installed on the agent before a build. Add to this list as needed;
+// the rust bootstrap's fuller deps (see the rust repo README) include e.g.
+// llvm, gcc7, python, cmake, libssh, perl.
+def BUILD_PKGS = ['cmake']
 
 pipeline {
     agent { label "${NODE_LABEL}" }
@@ -183,6 +187,15 @@ pipeline {
                         '''
                     }
                 }
+            }
+        }
+
+        stage('Install Build Dependencies') {
+            when {
+                expression { return env.BUILD_VERSIONS?.trim() }
+            }
+            steps {
+                sh "pkg install -y ${BUILD_PKGS.join(' ')}"
             }
         }
 
