@@ -69,18 +69,21 @@ To publish version `X`:
 Publishing is **refused on PR builds** (two guards) — a PR is untrusted,
 unmerged code. Only a non-PR (`master`) run with `PUBLISH_VERSION` publishes.
 
-### Publish configuration (set on the Jenkins job, not committed)
+### Publish configuration (folder-scoped credentials, not committed)
 
-Kept out of this public repo, matching the `release-git` convention; the job
-**fails closed** before the build if a publish is requested while these are
-unset:
+A Multibranch Pipeline has no per-job environment-variable field, so the publish
+config is carried as **folder-scoped credentials** added on the Jenkins job.
+Only the credential **ids** are hardcoded in the Jenkinsfile (ids are not
+sensitive — `release-git` hardcodes one too); the values live in Jenkins, scoped
+to the folder, so different folders can supply different values. A publish run
+**fails fast** (before the multi-hour build) if either id is missing.
 
-| Variable | Meaning |
-|---|---|
-| `RUST_BOOTSTRAP_RSYNC_DEST` | rsync-daemon dest `host/module[/subpath]`, no scheme/user — e.g. `avalon.dragonflybsd.org/rust`. The job builds `rsync://${RSYNC_USER}@${dest}/${version}/`. |
-| `RSYNC_CREDENTIALS_ID` | id of a username/password credential for the rsync daemon (password read via `RSYNC_PASSWORD`). |
+Add these two credentials on the job (**Credentials** → this folder):
 
-The credential username/password auth mirrors `dragonflybsd-complete`.
+| Credential id | Kind | Value |
+|---|---|---|
+| `rust-bootstrap-rsync-dest` | Secret text | rsync-daemon dest `host/module[/subpath]`, no scheme/user — e.g. `avalon.dragonflybsd.org/rust`. The job builds `rsync://${RSYNC_USER}@${dest}/${version}/`. |
+| `rust-upload` | Username with password | rsync daemon login (password consumed via `RSYNC_PASSWORD`, mirroring `dragonflybsd-complete`). |
 
 ### Migrating the bootstrap archive
 

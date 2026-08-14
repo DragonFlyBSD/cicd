@@ -23,17 +23,21 @@
 // needs no credentials; credentials are used only for publishing.
 //
 // Publish target/credentials are NOT committed here (this is a public repo).
-// They must be set on the Jenkins job, and the pipeline fails closed if a
-// publish is requested while they are unset:
-//   RUST_BOOTSTRAP_RSYNC_DEST : rsync-daemon dest, host/module/path with no
-//                               scheme or user, e.g. host/assets-upload/rust
-//   RSYNC_CREDENTIALS_ID      : id of a username/password credential for the
-//                               rsync daemon (password read via RSYNC_PASSWORD)
+// Only the credential IDS live here; the values are folder-scoped credentials
+// added on the Jenkins job, so different folders can supply different values:
+//   RSYNC_DEST_CREDENTIALS_ID  : "Secret text" holding the rsync-daemon dest,
+//                                host/module[/subpath], no scheme or user,
+//                                e.g. avalon.dragonflybsd.org/rust
+//   RSYNC_LOGIN_CREDENTIALS_ID : "Username with password" for the rsync daemon
+//                                (password consumed via the RSYNC_PASSWORD env)
+// A publish run fails fast if either credential id is missing on the job.
 
 def NODE_LABEL = 'dragonflybsd-nvmm large'
 def BUILD_TIMEOUT_HOURS = 8
 def RUST_REPO_URL = 'https://github.com/DragonFlyBSD/rust-bootstrap-dragonfly.git'
 def RUST_TARGET = 'x86_64-unknown-dragonfly'
+def RSYNC_DEST_CREDENTIALS_ID = 'rust-bootstrap-rsync-dest'
+def RSYNC_LOGIN_CREDENTIALS_ID = 'rust-upload'
 
 pipeline {
     agent { label "${NODE_LABEL}" }
@@ -159,17 +163,24 @@ pipeline {
 
         stage('Validate Publish Config') {
             // Fail fast, before the multi-hour build, if a publish was requested
-            // but the target/credentials are not configured on the Jenkins job.
+            // but the publish credentials are not present on the Jenkins job.
+            // Binding them resolves the ids; a missing id errors here, not after
+            // hours of building.
             when {
                 expression { return env.DO_PUBLISH == 'true' }
             }
             steps {
                 script {
-                    if (!env.RUST_BOOTSTRAP_RSYNC_DEST?.trim()) {
-                        error('RUST_BOOTSTRAP_RSYNC_DEST must be configured on the Jenkins job to publish (host/module/path of the rsync daemon dest).')
-                    }
-                    if (!env.RSYNC_CREDENTIALS_ID?.trim()) {
-                        error('RSYNC_CREDENTIALS_ID must be configured on the Jenkins job to publish (username/password credential for the rsync daemon).')
+                    withCredentials([
+                        string(credentialsId: RSYNC_DEST_CREDENTIALS_ID, variable: 'RUST_BOOTSTRAP_RSYNC_DEST'),
+                        usernamePassword(credentialsId: RSYNC_LOGIN_CREDENTIALS_ID,
+                                         usernameVariable: 'RSYNC_USER', passwordVariable: 'RSYNC_PASSWORD')
+                    ]) {
+                        sh '''
+                            set -eu
+                            test -n "$RUST_BOOTSTRAP_RSYNC_DEST" || { echo "rsync dest credential is empty" >&2; exit 1; }
+                            test -n "$RSYNC_USER" || { echo "rsync login credential has no username" >&2; exit 1; }
+                        '''
                     }
                 }
             }
@@ -213,11 +224,11 @@ pipeline {
                     // x.py dist (located by name, so we do not assume the exact
                     // build/dist path), checksum them, and rsync to the archive.
                     withEnv(["RUST_VERSION=${v}", "RUST_TARGET=${RUST_TARGET}"]) {
-                        withCredentials([usernamePassword(
-                            credentialsId: env.RSYNC_CREDENTIALS_ID,
-                            usernameVariable: 'RSYNC_USER',
-                            passwordVariable: 'RSYNC_PASSWORD'
-                        )]) {
+                        withCredentials([
+                            string(credentialsId: RSYNC_DEST_CREDENTIALS_ID, variable: 'RUST_BOOTSTRAP_RSYNC_DEST'),
+                            usernamePassword(credentialsId: RSYNC_LOGIN_CREDENTIALS_ID,
+                                             usernameVariable: 'RSYNC_USER', passwordVariable: 'RSYNC_PASSWORD')
+                        ]) {
                             sh 'pkg install -y rsync'
                             sh '''
                                 set -eu
