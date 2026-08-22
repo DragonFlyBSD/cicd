@@ -1,5 +1,8 @@
 // PR CI + bootstrap publishing for DragonFlyBSD/rust-bootstrap-dragonfly.
 // PR: build the changed version dir(s) to verify. master: build + publish them.
+// The VERSION parameter overrides that and builds exactly the version given,
+// which is how a failed build is retried and how an existing version is
+// republished without pushing a commit.
 // Loaded from cicd via Remote Jenkinsfile Provider, so scm is cicd and the rust
 // source is fetched explicitly. See docs/rust-bootstrap-ci.md.
 
@@ -22,6 +25,14 @@ def changedVersions(String base) {
 
 pipeline {
     agent { label NODE_LABEL }
+
+    parameters {
+        string(
+            name: 'VERSION',
+            defaultValue: '',
+            description: 'Leave EMPTY to build whatever the commit changed. Set to a version (e.g. 1.86.0) to build exactly that one — on master that also republishes it. Use this to retry a failed build.'
+        )
+    }
 
     options {
         timestamps()
@@ -62,7 +73,16 @@ pipeline {
         stage('Plan') {
             steps {
                 script {
-                    def versions = changedVersions(env.DIFF_BASE)
+                    String asked = params.VERSION?.trim()
+                    def versions
+                    if (asked) {
+                        if (!fileExists("${asked}/build.sh")) {
+                            error "VERSION=${asked}: no ${asked}/build.sh in this checkout."
+                        }
+                        versions = [asked]
+                    } else {
+                        versions = changedVersions(env.DIFF_BASE)
+                    }
                     env.BUILD_VERSIONS = versions.join(' ')
                     String what = env.PUBLISH == 'true' ? 'Build + publish' : 'Build (verify)'
                     echo versions.isEmpty() ? 'Nothing to build.' : "${what}: ${env.BUILD_VERSIONS}"
@@ -70,11 +90,18 @@ pipeline {
             }
         }
 
+        // Build and publish are interleaved per version, not split into two
+        // stages: each version's build.sh bootstraps from the *published*
+        // tarballs of the previous one, so N must reach the archive before
+        // N+1 starts. It also means a run that dies partway keeps whatever it
+        // already published.
         stage('Build') {
             when { expression { env.BUILD_VERSIONS?.trim() } }
             steps {
-                sh "pkg install -y ${BUILD_PKGS}"
                 script {
+                    boolean publishing = env.PUBLISH == 'true'
+                    sh "pkg install -y ${BUILD_PKGS}" + (publishing ? ' rsync' : '')
+
                     for (v in env.BUILD_VERSIONS.trim().split(/\s+/)) {
                         sh """
                             set -eu
@@ -82,34 +109,25 @@ pipeline {
                             cd '${v}'
                             sh ./build.sh "\$WORKSPACE/build-${v}"
                         """
-                    }
-                }
-            }
-        }
-
-        stage('Publish') {
-            when { expression { env.PUBLISH == 'true' && env.BUILD_VERSIONS?.trim() } }
-            steps {
-                withCredentials([
-                    string(credentialsId: RSYNC_DEST_CRED, variable: 'RSYNC_DEST'),
-                    usernamePassword(credentialsId: RSYNC_LOGIN_CRED,
-                                     usernameVariable: 'RSYNC_USER', passwordVariable: 'RSYNC_PASSWORD'),
-                ]) {
-                    sh 'pkg install -y rsync'
-                    script {
-                        for (v in env.BUILD_VERSIONS.trim().split(/\s+/)) {
-                            withEnv(["V=${v}", "T=${RUST_TARGET}"]) {
-                                sh '''
-                                    set -eu
-                                    dist=$(dirname "$(find "$WORKSPACE/build-$V" -type f -name "cargo-$V-$T.tar.xz" | head -1)")
-                                    cd "$dist"
-                                    files=""
-                                    for c in cargo-$V-$T rustc-$V-$T rust-std-$V-$T; do
-                                        sha256 -r "$c.tar.xz" > "$c.tar.xz.sha256"
-                                        files="$files $c.tar.xz $c.tar.xz.sha256"
-                                    done
-                                    rsync -av --mkpath $files "rsync://${RSYNC_USER}@${RSYNC_DEST}/$V/"
-                                '''
+                        if (publishing) {
+                            withCredentials([
+                                string(credentialsId: RSYNC_DEST_CRED, variable: 'RSYNC_DEST'),
+                                usernamePassword(credentialsId: RSYNC_LOGIN_CRED,
+                                                 usernameVariable: 'RSYNC_USER', passwordVariable: 'RSYNC_PASSWORD'),
+                            ]) {
+                                withEnv(["V=${v}", "T=${RUST_TARGET}"]) {
+                                    sh '''
+                                        set -eu
+                                        dist=$(dirname "$(find "$WORKSPACE/build-$V" -type f -name "cargo-$V-$T.tar.xz" | head -1)")
+                                        cd "$dist"
+                                        files=""
+                                        for c in cargo-$V-$T rustc-$V-$T rust-std-$V-$T; do
+                                            sha256 -r "$c.tar.xz" > "$c.tar.xz.sha256"
+                                            files="$files $c.tar.xz $c.tar.xz.sha256"
+                                        done
+                                        rsync -av --mkpath $files "rsync://${RSYNC_USER}@${RSYNC_DEST}/$V/"
+                                    '''
+                                }
                             }
                         }
                     }

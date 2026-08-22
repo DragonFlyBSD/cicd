@@ -16,6 +16,12 @@ Two modes, keyed off the branch:
 Each `build.sh` is a multi-hour Rust+LLVM bootstrap, so only the version dir(s)
 that changed (vs the PR base, or vs the previous master commit) are built.
 
+The **`VERSION` build parameter** overrides that choice: set it (e.g. `1.86.0`)
+and the run builds exactly that version dir, whatever the commit touched — on
+master it republishes it too. That is how you retry a build that failed for a
+transient reason, and how you republish an existing version, without pushing a
+commit. Leave it empty for the normal behaviour.
+
 ## How it works
 
 - A **Multibranch Pipeline** job tracks the repo via the **GitHub Branch
@@ -36,7 +42,12 @@ Each version bootstraps from the previous one — `1.87.0`'s `build.sh` download
 the `1.86.0` DragonFly tarballs (`BOOTSTRAP_URL` in the rust repo's
 `common.sh`). So a version's artifacts must be published before the next version
 can build. Publishing happens automatically when a version dir lands on master;
-to (re)publish an existing version, push a commit touching its dir to master.
+to (re)publish an existing version, run the master job with `VERSION` set to it.
+
+Because of that chain, the job builds and publishes **one version at a time**:
+each version is pushed to the archive before the next one starts, so a commit
+touching two versions works, and a run that dies partway keeps whatever it had
+already published.
 
 `common.sh` fetches bootstraps from the legacy archive first, then the new one
 (`avalon.dragonflybsd.org/misc/distfiles/rust-bootstrap`), so older versions keep
@@ -69,6 +80,10 @@ credential (App or PAT) that can read the repo and write commit statuses.
    Pushes).
 
 ## Knobs
+
+`VERSION` build parameter: see above. Note that Jenkins learns a job's
+parameters from its last build, so the option only appears on a branch job that
+has already run this pipeline once.
 
 Top of `jenkins/Jenkinsfile.rust-bootstrap-ci`: `NODE_LABEL` (agent label),
 `BUILD_PKGS` (packages installed before building), the two credential ids. Build
