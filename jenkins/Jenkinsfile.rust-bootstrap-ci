@@ -9,7 +9,7 @@
 def NODE_LABEL       = 'dragonflybsd-nvmm xlarge'
 def RUST_REPO_URL    = 'https://github.com/DragonFlyBSD/rust-bootstrap-dragonfly.git'
 def RUST_TARGET      = 'x86_64-unknown-dragonfly'
-def BUILD_PKGS       = 'cmake ninja perl5 libssh gmake'
+def BUILD_PKGS       = 'cmake ninja perl5 libssh gmake python'
 def RSYNC_DEST_CRED  = 'rust-bootstrap-rsync-dest'   // Secret text: host/module
 def RSYNC_LOGIN_CRED = 'rust-upload'                 // Username with password
 
