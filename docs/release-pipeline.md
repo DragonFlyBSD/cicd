@@ -78,9 +78,8 @@ Additional fixed defaults for the first Jenkinsfile:
 ```text
 Jenkins agent label: dragonflybsd-nvmm large
 Jenkins credential ID: release-rehersal
-Jenkins GPG private key credential ID: release-rehersal-gpg-private-key
-Jenkins GPG passphrase credential ID: release-rehersal-gpg-passphrase
-Git commit author: configured in the Jenkins job (GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL)
+Signing: external; Jenkins holds no signing private key
+Git commit author: job parameters or environment (GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL)
 Allowed approver: tuxillo
 Required approvals: 1 Jenkins user
 Artifact behavior: archive in Jenkins only, no copy/publish
@@ -134,10 +133,6 @@ The first use may require Jenkins Script Approval because the Active Choices scr
 
 There is intentionally no fallback branch list. Active Choices exposes a fallback script field in the Jenkins UI and requires it to return a valid String/List/Map. The configured fallback script must return only an `ERROR:` sentinel value and must not return `master` or any hardcoded branch list. The pipeline validation rejects any `BASE_BRANCH` value that starts with `ERROR:`.
 
-The Git Parameter Plugin was evaluated, but it normally needs Jenkins SCM context. That would require `Pipeline script from SCM` and a Jenkinsfile committed to a repo, which is not desired for this first version.
-
-If this becomes too brittle, use a separate dedicated pipeline repository later.
-
 Desired branch choices would be:
 
 ```text
@@ -156,22 +151,19 @@ refs/heads/master
 
 ## Version Logic
 
-The pipeline should read the current version from the cloned source, then compute the target version.
+The pipeline reads the branch marker from the source cloned from `ORIGIN_URL`.
+The selected branch determines which operations are permitted:
 
-Example current version:
+| Operation | BASE_BRANCH | Automatic target | Development update |
+|---|---|---|---|
+| `minor` | `master`, marker `DEVELOPMENT_6_5` | `6.6.0` | `6.7.0` |
+| `major` | `master`, marker `DEVELOPMENT_6_5` | `7.0.0` | `7.1.0` |
+| `patch` | `DragonFly_RELEASE_6_4`, marker `RELEASE_6_4` | Next final patch number | None |
+| `none` | Matching `DragonFly_RELEASE_x_y` | `x.y.0`, or TARGET_VERSION | None |
 
-```text
-6.4.0
-```
-
-Auto-bump behavior:
-
-```text
-VERSION_BUMP=major -> 7.0.0
-VERSION_BUMP=minor -> 6.6.0
-VERSION_BUMP=patch -> 6.4.1
-VERSION_BUMP=none  -> 6.4.0
-```
+A new major/minor series must be newer than the development series. An explicit
+`TARGET_VERSION` overrides version calculation but cannot bypass the branch
+rules. Release minor numbers must be even.
 
 For `patch`, the pipeline queries tags directly from the configured `origin`
 using `git ls-remote --tags --refs origin`, since a shallow clone may lack them.
@@ -179,11 +171,24 @@ It chooses one greater than the highest final `vMAJOR.MINOR.PATCH` tag in the
 selected release series. For example, with `v6.4.0`, `v6.4.1`, and `v6.4.2`, it
 chooses `6.4.3`. RC tags and tags from other series do not count. With no final
 tags in the series, it starts at `.1`. A query failure stops the build.
-`TARGET_VERSION` still overrides automatic calculation. Keep the fork's tags
-synced as well as its branches; missing remote tags affect the computed version.
+Keep the fork's tags synced as well as its branches.
 
-Run the version helper checks with `groovy tests/release-version.groovy` from
-the repository root (requires Groovy and a Java runtime).
+For subsequent RCs or a final release of an existing series, select its release
+branch and `VERSION_BUMP=none`. Set `RELEASE_STAGE` and `RC_NUMBER` as needed.
+For a nonzero patch version (e.g. promoting `6.4.3rc1` to `6.4.3`), also set
+`TARGET_VERSION=6.4.3`. This path changes no source files and never updates
+master. New minor/major branch creation is not repeated.
+
+Run the checks from the repository root (requires Groovy and a Java runtime):
+
+```sh
+groovy tests/release-version.groovy
+groovy tests/release-workflow.groovy
+```
+
+The integration checks execute the pipeline's Git stages against disposable
+local repositories, including atomic push rejection and concurrent ref changes.
+They do not replace verification of Jenkins CPS, approval, or GPG integration.
 
 DragonFly minor releases appear to use even minor numbers, so `minor` should bump by `2`:
 
@@ -196,9 +201,9 @@ If `TARGET_VERSION` is provided, it wins, but must be validated.
 Validation examples:
 
 ```text
-VERSION_BUMP=minor + TARGET_VERSION=6.6.0 -> valid
-VERSION_BUMP=minor + TARGET_VERSION=6.5.0 -> reject or require explicit override
-VERSION_BUMP=patch + TARGET_VERSION=6.4.1 -> valid
+master DEVELOPMENT_6_5 + VERSION_BUMP=minor + TARGET_VERSION=6.6.0 -> valid
+VERSION_BUMP=minor + TARGET_VERSION=6.5.0 -> reject (odd release minor)
+DragonFly_RELEASE_6_4 + VERSION_BUMP=patch + TARGET_VERSION=6.4.1 -> valid
 ```
 
 ## Derived Values
@@ -252,58 +257,53 @@ release tag    = v6.6.1
 The pipeline clones only from `origin`.
 
 ```text
-1. Clone ORIGIN_URL.
-2. Verify only origin is configured.
-3. Verify origin URL matches the allowed cloned/test repo pattern.
-4. Fetch branches and tags.
-5. Checkout BASE_BRANCH.
-6. Compute target version and derived names.
-7. Create or checkout release branch.
-8. Apply release branch changes.
-9. Apply master/base branch changes if needed.
-10. Generate diffs.
-11. Wait for approval.
-12. Commit changes.
-13. Push branches to origin.
-14. Wait for approval.
-15. Create tag.
-16. Push tag to origin.
-17. Stop after pushing the signed tag for the first implementation.
+1. Validate origin and clone BASE_BRANCH; record its exact commit.
+2. Compute target version and validate the branch/operation combination.
+3. Read remote refs; fail on query errors or unexpected branch changes.
+4. For a new series, prepare release and master version edits in worktrees.
+   For an existing series, reuse the checked-out release branch without edits.
+5. Archive the plan and diffs, then require human approval.
+6. For a new series, commit both branches and push them atomically with leases.
+   For an existing series, recheck the release branch tip; push no branches.
+7. Emit the external signing request for the exact reviewed release commit.
+8. Wait for and verify the signed tag against that commit and authorized keys.
 ```
 
 ## Branch Rules
 
-For new major/minor releases:
+New major/minor releases require `BASE_BRANCH=master` and a DEVELOPMENT marker.
+They create `DragonFly_RELEASE_x_y`, update the release files, and advance master
+to development `x.(y+1)`. Master's `param.h` history records both release and
+next-development versions. A maintenance branch cannot be used as the source
+for this operation.
 
-```text
-Create DragonFly_RELEASE_x_y from BASE_BRANCH.
-Update release branch files.
-Update BASE_BRANCH/master files for next development version.
-Push both branches to origin after approval.
-```
+Patch releases and `VERSION_BUMP=none` require the matching existing
+`DragonFly_RELEASE_x_y` branch with its RELEASE marker. They reuse `src`, make
+no source edits or commits, and leave master untouched. RC tags are
+`vx.y.zrcN`; final tags are `vx.y.z`.
 
-For patch releases:
+## Atomic publication and recovery
 
-```text
-Use existing DragonFly_RELEASE_x_y branch.
-First implementation does not edit source files for patch releases.
-Create and push only the signed patch tag after approval.
-The checked-out `src` worktree is already on the release branch and is reused directly.
-Do not fetch into the checked-out branch.
-Do not create a second `release-src` worktree for patch releases.
-```
+New release and master commits are published in one `git push --atomic`.
+Explicit leases require master to remain at the reviewed base commit and the
+new release branch to remain absent. Concurrent changes, rejection of either
+branch, or a server without atomic-push support fail without partially updating
+branches. There is no fallback to separate pushes.
 
-For RC releases:
+If the build stops after both branches were published (for example, while
+waiting for external signing), do not rerun major/minor creation. Instead:
 
-```text
-Tag release branch as vx.y.zrcN.
-```
+1. Review the previous archived plan and the current release branch tip.
+2. Select that release branch as `BASE_BRANCH` and `VERSION_BUMP=none`.
+3. Set the original `TARGET_VERSION`, `RELEASE_STAGE`, and `RC_NUMBER`.
+4. Review and approve the new run; it emits a signing request without commits
+   or branch pushes.
 
-For final releases:
-
-```text
-Tag release branch as vx.y.z.
-```
+With `VERSION_BUMP=none`, an already-present tag is allowed through planning so
+it can be verified by the normal authorized-signature/exact-commit checks. It
+is never replaced. A wrong or unsigned existing tag still fails verification.
+Other operations reject an existing target tag. If a release branch moves while
+approval is pending, the run fails and must be restarted to review the new tip.
 
 ## Files To Modify
 
@@ -330,7 +330,7 @@ etc/Makefile.usr
 
 if dports/pkg defaults need changing.
 
-For patch releases in the first implementation:
+For patch releases, subsequent RCs, and final tags on an existing branch:
 
 ```text
 No source-file edits.

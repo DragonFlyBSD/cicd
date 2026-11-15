@@ -16,7 +16,7 @@ def parseVersion(String value) {
 
 def readBranchInfo(String checkoutDir) {
     def newvers = readFile("${checkoutDir}/sys/conf/newvers.sh")
-    def m = newvers =~ /(?m)^BRANCH="(DEVELOPMENT|RELEASE)_(\d+)_(\d+)"\s*$/
+    def m = newvers =~ /(?m)^BRANCH="(DEVELOPMENT|RELEASE)_(\d+)_(\d+)"[ \t]*$/
     if (!m.find()) {
         error('Unable to find BRANCH="DEVELOPMENT_x_y" or BRANCH="RELEASE_x_y" in sys/conf/newvers.sh')
     }
@@ -83,6 +83,28 @@ def versionString(Map v) {
     return "${v.major}.${v.minor}.${v.patch}"
 }
 
+def releaseAction(Map branchInfo, String baseBranch, String versionBump, Map target) {
+    if (versionBump in ['major', 'minor']) {
+        if (baseBranch != 'master' || branchInfo.kind != 'DEVELOPMENT') {
+            error('New major/minor releases must start from master with a DEVELOPMENT branch marker.')
+        }
+        if (target.major < branchInfo.major ||
+                (target.major == branchInfo.major && target.minor <= branchInfo.minor)) {
+            error('A new release series must be newer than the current development series.')
+        }
+        return 'create'
+    }
+    if (!(versionBump in ['patch', 'none'])) {
+        error("Unsupported VERSION_BUMP '${versionBump}'")
+    }
+    String expectedBranch = "DragonFly_RELEASE_${target.major}_${target.minor}"
+    if (baseBranch != expectedBranch || branchInfo.kind != 'RELEASE' ||
+            branchInfo.major != target.major || branchInfo.minor != target.minor) {
+        error("Tagging an existing release requires BASE_BRANCH=${expectedBranch} with its matching RELEASE marker.")
+    }
+    return 'tag'
+}
+
 def paramVersion(Map v) {
     return (v.major * 100000) + (v.minor * 100)
 }
@@ -91,7 +113,7 @@ def updateNewvers(String checkoutDir, String branchKind, Map v) {
     String path = "${checkoutDir}/sys/conf/newvers.sh"
     String text = readFile(path)
     String replacement = "BRANCH=\"${branchKind}_${v.major}_${v.minor}\""
-    String updated = text.replaceFirst(/(?m)^BRANCH="(?:DEVELOPMENT|RELEASE)_\d+_\d+"\s*$/, replacement)
+    String updated = text.replaceFirst(/(?m)^BRANCH="(?:DEVELOPMENT|RELEASE)_\d+_\d+"[ \t]*$/, replacement)
     if (updated == text) {
         error("No BRANCH line updated in ${path}")
     }
@@ -108,18 +130,25 @@ def updateMakefileUsrBranch(String checkoutDir, String releaseBranch) {
     writeFile(file: path, text: updated)
 }
 
-def updateParamH(String checkoutDir, Map v, String label) {
+def updateParamH(String checkoutDir, Map v, String label, Map releaseVersion = null) {
     String path = "${checkoutDir}/sys/sys/param.h"
     String text = readFile(path)
     int number = paramVersion(v)
-    String comment = " * ${number} - ${v.major}.${v.minor} ${label}"
-
-    if (!text.contains(comment)) {
-        String marker = ' */\n#undef __DragonFly_version'
-        if (!text.contains(marker)) {
-            error("Unable to locate __DragonFly_version comment block marker in ${path}")
+    def history = []
+    if (releaseVersion != null) {
+        history << [version: releaseVersion, label: 'release']
+    }
+    history << [version: v, label: label]
+    history.each { entry ->
+        def version = entry.version
+        String comment = " * ${paramVersion(version)} - ${version.major}.${version.minor} ${entry.label}"
+        if (!text.contains(comment)) {
+            String marker = ' */\n#undef __DragonFly_version'
+            if (!text.contains(marker)) {
+                error("Unable to locate __DragonFly_version comment block marker in ${path}")
+            }
+            text = text.replace(marker, "${comment}\n${marker}")
         }
-        text = text.replace(marker, "${comment}\n${marker}")
     }
 
     String updated = text.replaceFirst(/(?m)^#define __DragonFly_version\s+\d+\s+\/\* propagated to newvers \*\//,
@@ -150,7 +179,7 @@ pipeline {
     // properties([parameters(...)]) call, which replaces the parameter property.
     parameters {
         choice(name: 'VERSION_BUMP', choices: ['minor', 'major', 'patch', 'none'],
-            description: 'How to calculate the release version unless TARGET_VERSION is set')
+            description: 'major/minor: create a series from master; patch: next patch; none: tag an existing series')
         choice(name: 'RELEASE_STAGE', choices: ['rc', 'final'],
             description: 'Create a release candidate or a final release')
         string(name: 'TARGET_VERSION', defaultValue: '',
@@ -165,6 +194,7 @@ pipeline {
         // Configured in the Jenkins job, NOT committed here, so this public repo
         // stays free of environment-specific / personal values. The pipeline
         // fails closed (see Validate Parameters) if any are unset:
+        // Values may be supplied as String Parameters or environment variables.
         //   ALLOWED_ORIGIN_PREFIX : approved writable origin URL prefix
         //   GIT_AUTHOR_NAME       : commit author name
         //   GIT_AUTHOR_EMAIL      : commit author email
@@ -172,7 +202,7 @@ pipeline {
         RELEASE_APPROVERS = 'tuxillo'
         // Release tooling (this repo): scripts/verify-release-tag and the
         // keys/authorized-signers allowlist are cloned onto the agent because
-        // this job is an inline pipeline and does not check this repo out.
+        // source checkout and release verification tooling are kept separate.
         RELEASE_TOOLS_URL = 'https://github.com/DragonFlyBSD/cicd.git'
         RELEASE_TOOLS_REF = 'master'
         // How long to wait for the externally-signed tag to appear on origin.
@@ -300,6 +330,8 @@ EOF
                         error("Target release minor version must be even, got ${versionString(target)}")
                     }
 
+                    env.RELEASE_ACTION = releaseAction(branchInfo, env.BASE_BRANCH_NORMALIZED, params.VERSION_BUMP, target)
+                    env.BASE_COMMIT = sh(returnStdout: true, script: 'git -C src rev-parse HEAD').trim()
                     env.CURRENT_BRANCH_KIND = branchInfo.kind
                     env.CURRENT_BRANCH_VERSION = "${branchInfo.major}.${branchInfo.minor}"
                     env.TARGET_VERSION_COMPUTED = versionString(target)
@@ -314,10 +346,10 @@ EOF
                         ? "DragonFly ${versionString(target)}rc${params.RC_NUMBER}"
                         : "DragonFly ${versionString(target)}"
                     // Worktree whose HEAD the signed tag must point at.
-                    env.SIGNING_WORKTREE = params.VERSION_BUMP == 'patch' ? 'src' : 'release-src'
+                    env.SIGNING_WORKTREE = env.RELEASE_ACTION == 'create' ? 'release-src' : 'src'
 
                     def nextDev = [major: target.major, minor: target.minor + 1, patch: 0]
-                    env.NEXT_DEV_VERSION = versionString(nextDev)
+                    env.NEXT_DEV_VERSION = env.RELEASE_ACTION == 'create' ? versionString(nextDev) : 'unchanged'
                     env.NEXT_DEV_MAJOR = nextDev.major.toString()
                     env.NEXT_DEV_MINOR = nextDev.minor.toString()
                     env.NEXT_DEV_PATCH = nextDev.patch.toString()
@@ -325,8 +357,10 @@ EOF
                     writeFile(file: 'release-plan.txt', text: """
 Origin URL: ${params.ORIGIN_URL}
 Base branch: ${env.BASE_BRANCH_NORMALIZED}
+Base commit: ${env.BASE_COMMIT}
 Current source branch marker: ${branchInfo.kind}_${branchInfo.major}_${branchInfo.minor}
 Version bump: ${params.VERSION_BUMP}
+Action: ${env.RELEASE_ACTION}
 Target version: ${env.TARGET_VERSION_COMPUTED}
 Release stage: ${params.RELEASE_STAGE}
 RC number: ${params.RC_NUMBER}
@@ -362,21 +396,35 @@ EOF
                         export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
                         export GIT_TERMINAL_PROMPT=0
 
-                        if git ls-remote --exit-code --tags "$ORIGIN_URL" "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+                        # Query failures must not be treated as absent refs.
+                        git -C src ls-remote --heads --tags --refs origin > remote-refs.txt
+                        tag_oid=$(awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref {print $1}' remote-refs.txt)
+                        release_oid=$(awk -v ref="refs/heads/$RELEASE_BRANCH" '$2 == ref {print $1}' remote-refs.txt)
+                        base_oid=$(awk -v ref="refs/heads/$BASE_BRANCH_NORMALIZED" '$2 == ref {print $1}' remote-refs.txt)
+                        if [ "$base_oid" != "$BASE_COMMIT" ]; then
+                            echo "Base branch changed since checkout; rerun to review its new tip." >&2
+                            exit 1
+                        fi
+
+                        if [ -n "$tag_oid" ] && [ "$VERSION_BUMP" != "none" ]; then
                             echo "Tag already exists: $RELEASE_TAG" >&2
                             exit 1
                         fi
 
-                        if [ "$VERSION_BUMP" != "patch" ]; then
-                            if git ls-remote --exit-code --heads "$ORIGIN_URL" "refs/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
-                                echo "Release branch already exists for this non-patch release: $RELEASE_BRANCH" >&2
+                        if [ -n "$tag_oid" ]; then
+                            echo "Existing tag $RELEASE_TAG will be verified against the reviewed commit; it will not be replaced."
+                        fi
+
+                        if [ "$RELEASE_ACTION" = "create" ]; then
+                            if [ -n "$release_oid" ]; then
+                                echo "Release branch already exists; select it as BASE_BRANCH with VERSION_BUMP=none to tag it: $RELEASE_BRANCH" >&2
                                 exit 1
                             fi
                         fi
 
-                        if [ "$VERSION_BUMP" = "patch" ]; then
-                            if ! git ls-remote --exit-code --heads "$ORIGIN_URL" "refs/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
-                                echo "Patch release branch does not exist: $RELEASE_BRANCH" >&2
+                        if [ "$RELEASE_ACTION" = "tag" ]; then
+                            if [ -z "$release_oid" ]; then
+                                echo "Release branch does not exist: $RELEASE_BRANCH" >&2
                                 exit 1
                             fi
                         fi
@@ -391,9 +439,7 @@ EOF
             steps {
                 script {
                     def target = parseVersion(env.TARGET_VERSION_COMPUTED)
-                    def nextDev = parseVersion(env.NEXT_DEV_VERSION)
-
-                    if (params.VERSION_BUMP == 'patch') {
+                    if (env.RELEASE_ACTION == 'tag') {
                         sh '''
                             set -eu
                             cd src
@@ -402,6 +448,7 @@ EOF
                             git diff --name-only > ../release-branch.files
                         '''
                     } else {
+                        def nextDev = parseVersion(env.NEXT_DEV_VERSION)
                         sh 'cd src && git worktree add -b "$RELEASE_BRANCH" ../release-src'
                         updateNewvers('release-src', 'RELEASE', target)
                         updateMakefileUsrBranch('release-src', env.RELEASE_BRANCH)
@@ -410,7 +457,7 @@ EOF
                         sh 'cd release-src && git diff --binary > ../release-branch.patch && git diff --name-only > ../release-branch.files'
 
                         updateNewvers('src', 'DEVELOPMENT', nextDev)
-                        updateParamH('src', nextDev, 'development')
+                        updateParamH('src', nextDev, 'development', target)
                     }
 
                     sh '''
@@ -420,7 +467,7 @@ EOF
                         git diff --name-only > ../current-branch.files
                     '''
 
-                    if (params.VERSION_BUMP == 'patch') {
+                    if (env.RELEASE_ACTION == 'tag') {
                         sh ': > master.patch && : > master.files'
                     } else {
                         sh 'cp current-branch.patch master.patch && cp current-branch.files master.files'
@@ -437,6 +484,8 @@ EOF
                         printf '{\n'
                         printf '  "origin_url": "%s",\n' "$ORIGIN_URL"
                         printf '  "base_branch": "%s",\n' "$BASE_BRANCH_NORMALIZED"
+                        printf '  "base_commit": "%s",\n' "$BASE_COMMIT"
+                        printf '  "action": "%s",\n' "$RELEASE_ACTION"
                         printf '  "current_branch_marker": "%s_%s",\n' "$CURRENT_BRANCH_KIND" "$CURRENT_BRANCH_VERSION"
                         printf '  "version_bump": "%s",\n' "$VERSION_BUMP"
                         printf '  "target_version": "%s",\n' "$TARGET_VERSION_COMPUTED"
@@ -461,6 +510,8 @@ Approve DragonFly release Git workflow?
 
 Origin: ${params.ORIGIN_URL}
 Base branch: ${env.BASE_BRANCH_NORMALIZED}
+Base commit: ${env.BASE_COMMIT}
+Action: ${env.RELEASE_ACTION}
 Target version: ${env.TARGET_VERSION_COMPUTED}
 Release branch: ${env.RELEASE_BRANCH}
 Release tag: ${env.RELEASE_TAG}
@@ -511,25 +562,38 @@ EOF
                         export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
                         export GIT_TERMINAL_PROMPT=0
 
-                        if [ "$VERSION_BUMP" = "patch" ]; then
-                            # Patch release: no source edits, no new commit. The tag will
+                        if [ "$RELEASE_ACTION" = "tag" ]; then
+                            # Existing series: no source edits, no new commit. The tag will
                             # point at the existing release branch tip already on origin.
                             cd "$WORKSPACE/src"
                             git status --short
+                            git ls-remote --exit-code --heads origin "refs/heads/$RELEASE_BRANCH" > "$WORKSPACE/release-head.txt"
+                            current=$(awk '{print $1}' "$WORKSPACE/release-head.txt")
+                            if [ "$current" != "$BASE_COMMIT" ]; then
+                                echo "Release branch changed during approval; rerun to review its new tip." >&2
+                                exit 1
+                            fi
                         else
                             cd "$WORKSPACE/release-src"
                             git config user.name "$GIT_AUTHOR_NAME"
                             git config user.email "$GIT_AUTHOR_EMAIL"
                             git add sys/sys/param.h sys/conf/newvers.sh etc/Makefile.usr
                             git commit -m "Create DragonFly $TARGET_VERSION_COMPUTED release branch"
-                            git push origin "$RELEASE_BRANCH"
 
                             cd "$WORKSPACE/src"
                             git config user.name "$GIT_AUTHOR_NAME"
                             git config user.email "$GIT_AUTHOR_EMAIL"
                             git add sys/sys/param.h sys/conf/newvers.sh
                             git commit -m "Bump DragonFly development version to $NEXT_DEV_VERSION"
-                            git push origin "$BASE_BRANCH_NORMALIZED"
+                            # Publish both branches together or neither. Leases
+                            # reject concurrent changes made during approval.
+                            # Servers without atomic-push support fail safely.
+                            git push --atomic \
+                                "--force-with-lease=refs/heads/$RELEASE_BRANCH:" \
+                                "--force-with-lease=refs/heads/$BASE_BRANCH_NORMALIZED:$BASE_COMMIT" \
+                                origin \
+                                "refs/heads/$RELEASE_BRANCH:refs/heads/$RELEASE_BRANCH" \
+                                "refs/heads/$BASE_BRANCH_NORMALIZED:refs/heads/$BASE_BRANCH_NORMALIZED"
                         fi
                         rm -f "$WORKSPACE/git-askpass.sh"
                     '''
