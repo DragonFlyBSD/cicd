@@ -2,9 +2,10 @@
 
 This document lives in the `DragonFlyBSD/cicd` repo and describes the design of
 the release Git workflow. The pipeline itself is `jenkins/Jenkinsfile.release-git`
-(derived from the original release-rehearsal pipeline). For now it remains an
-**inline** Jenkins Pipeline whose parameters are configured in the Jenkins job
-UI, not loaded from SCM. Signing is covered separately in `docs/signing.md`.
+(derived from the original release-rehearsal pipeline). The job can load it
+from this CI/CD repository using Pipeline script from SCM. Standard parameters
+are defined in the Jenkinsfile; `ORIGIN_URL` and the dynamic `BASE_BRANCH` are
+configured in the job UI. Signing is covered separately in `docs/signing.md`.
 
 ## Goal
 
@@ -35,23 +36,14 @@ It is a complete DragonFly-style release pipeline where the configured `origin` 
 
 ## Jenkins Parameters
 
+Configure `ORIGIN_URL` as a String Parameter and `BASE_BRANCH` as an Active
+Choices Parameter in the job UI. The Jenkinsfile defines these standard fields:
+
 ```groovy
 parameters {
-    string(
-        name: 'ORIGIN_URL',
-        defaultValue: 'https://git.example.net/<you>/DragonFlyBSD.git',
-        description: 'Writable cloned DragonFly repo used as origin'
-    )
-
-    string(
-        name: 'BASE_BRANCH',
-        defaultValue: 'master',
-        description: 'Base branch to release from'
-    )
-
     choice(
         name: 'VERSION_BUMP',
-        choices: ['major', 'minor', 'patch', 'none'],
+        choices: ['minor', 'major', 'patch', 'none'],
         description: 'How to calculate target version'
     )
 
@@ -107,11 +99,22 @@ On DragonFly agents, install missing gpg with: pkg install -y gnupg
 
 ## Jenkins Job Setup
 
-The first implementation should remain an inline Jenkins Pipeline script. Do not require committing the Jenkinsfile to the DragonFlyBSD test repository.
+Configure Pipeline script from SCM to load `jenkins/Jenkinsfile.release-git`
+from this CI/CD repository. The Jenkinsfile does not belong in the DragonFly
+source repository. An inline copy is also possible but must be kept in sync.
 
-Because the job remains inline and the Jenkinsfile should not be committed to the repository, configure parameters in the Jenkins job UI instead of defining them from the Jenkinsfile with `properties(...)`.
+The Jenkinsfile owns `VERSION_BUMP`, `RELEASE_STAGE`, `TARGET_VERSION`,
+`RC_NUMBER`, and `DRY_RUN`. Their defaults are minor, rc, empty, 1, and true.
+They are registered when the updated pipeline first runs; reopen **Build with
+Parameters** afterward to see the fields. That initial run still validates
+`ORIGIN_URL` and `BASE_BRANCH`, so configure those manually before running.
 
-The Jenkinsfile must not overwrite job parameters. The job UI is the source of truth for parameters.
+Declarative Pipeline preserves manually configured parameter names that it has
+not previously managed. Leave `ORIGIN_URL` and `BASE_BRANCH` out of the
+Jenkinsfile's `parameters {}` block. Do not replace the parameter property using
+`properties([parameters(...)])`, since that can remove the manually configured
+parameters. If migrating from an older pipeline that defined those names, check
+that they remain present after the first run and restore them in the UI if needed.
 
 Configure `BASE_BRANCH` in Jenkins UI as an Active Choices Parameter.
 

@@ -1,8 +1,8 @@
 // Active Choices "Groovy Script" for the BASE_BRANCH job parameter.
 //
 // Reference copy. The live copy is pasted into the Active Choices Parameter in
-// the Jenkins job UI, because Active Choices parameters cannot be declared from
-// the Jenkinsfile. Keep this file in sync with the UI by hand.
+// the Jenkins job UI, because this pipeline deliberately leaves parameter setup in
+// the job UI. Keep this file in sync with the UI by hand.
 //
 // Lists release-relevant branches from the canonical DragonFly repo so the
 // dropdown stays current. This only POPULATES the dropdown; the pipeline still
@@ -17,42 +17,34 @@
 // master: on any failure this returns an "ERROR:" sentinel, which the pipeline's
 // Validate Parameters stage rejects.
 
-def proc = ['git', 'ls-remote', '--heads',
-            'git://git.dragonflybsd.org/dragonfly.git'].execute()
-proc.waitForOrKill(30000)
-if (proc.exitValue() != 0) {
-    return ['ERROR: git ls-remote failed']
-}
+try {
+    def output = new StringBuffer()
+    def errors = new StringBuffer()
+    def process = [
+        'git', 'ls-remote', '--heads',
+        'git://git.dragonflybsd.org/dragonfly.git'
+    ].execute()
 
-boolean hasMaster = false
-def releases = []
-proc.text.eachLine { line ->
-    def m = line =~ /refs\/heads\/(.+)$/
-    if (!m) {
-        return
+    process.consumeProcessOutput(output, errors)
+    process.waitForOrKill(15000)
+
+    if (process.exitValue() != 0) {
+        return ['ERROR: git failed or timed out']
     }
-    def branch = m[0][1].trim()
-    if (branch == 'master') {
-        hasMaster = true
-    } else if (branch ==~ /DragonFly_RELEASE_\d+_\d+/) {
-        releases << branch
+
+    def branches = []
+    output.toString().eachLine { line ->
+        def fields = line.tokenize()
+        if (fields.size() == 2) {
+            def branch = fields[1].replaceFirst('^refs/heads/', '')
+            if (branch == 'master' ||
+                branch.matches('DragonFly_RELEASE_[0-9]+_[0-9]+')) {
+                branches.add(branch)
+            }
+        }
     }
-}
 
-// Newest release branch first, compared numerically (so 6_10 sorts above 6_8).
-releases = releases.unique().sort { a, b ->
-    def va = (a =~ /(\d+)_(\d+)/)[0]
-    def vb = (b =~ /(\d+)_(\d+)/)[0]
-    [vb[1].toInteger(), vb[2].toInteger()] <=> [va[1].toInteger(), va[2].toInteger()]
+    return branches ? branches : ['ERROR: no matching branches']
+} catch (Exception e) {
+    return ['ERROR: ' + e.toString()]
 }
-
-def result = []
-if (hasMaster) {
-    result << 'master'
-}
-result.addAll(releases)
-
-if (result.isEmpty()) {
-    return ['ERROR: no branches returned']
-}
-return result

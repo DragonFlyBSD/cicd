@@ -128,6 +128,24 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '20'))
     }
 
+    // Standard parameters are owned by this Jenkinsfile. ORIGIN_URL and the
+    // Active Choices BASE_BRANCH remain configured in the Jenkins job UI.
+    // Declarative preserves externally configured parameter names that this
+    // Jenkinsfile has not previously managed. Do not replace this with a
+    // properties([parameters(...)]) call, which replaces the parameter property.
+    parameters {
+        choice(name: 'VERSION_BUMP', choices: ['minor', 'major', 'patch', 'none'],
+            description: 'How to calculate the release version unless TARGET_VERSION is set')
+        choice(name: 'RELEASE_STAGE', choices: ['rc', 'final'],
+            description: 'Create a release candidate or a final release')
+        string(name: 'TARGET_VERSION', defaultValue: '',
+            description: 'Optional explicit version, e.g. 6.6.0; empty means automatic')
+        string(name: 'RC_NUMBER', defaultValue: '1',
+            description: 'Positive release candidate number; used only for rc')
+        booleanParam(name: 'DRY_RUN', defaultValue: true,
+            description: 'Prepare review material without committing, pushing, or requesting a signed tag')
+    }
+
     environment {
         // Configured in the Jenkins job, NOT committed here, so this public repo
         // stays free of environment-specific / personal values. The pipeline
