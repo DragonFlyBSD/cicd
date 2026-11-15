@@ -173,6 +173,18 @@ VERSION_BUMP=patch -> 6.4.1
 VERSION_BUMP=none  -> 6.4.0
 ```
 
+For `patch`, the pipeline queries tags directly from the configured `origin`
+using `git ls-remote --tags --refs origin`, since a shallow clone may lack them.
+It chooses one greater than the highest final `vMAJOR.MINOR.PATCH` tag in the
+selected release series. For example, with `v6.4.0`, `v6.4.1`, and `v6.4.2`, it
+chooses `6.4.3`. RC tags and tags from other series do not count. With no final
+tags in the series, it starts at `.1`. A query failure stops the build.
+`TARGET_VERSION` still overrides automatic calculation. Keep the fork's tags
+synced as well as its branches; missing remote tags affect the computed version.
+
+Run the version helper checks with `groovy tests/release-version.groovy` from
+the repository root (requires Groovy and a Java runtime).
+
 DragonFly minor releases appear to use even minor numbers, so `minor` should bump by `2`:
 
 ```text

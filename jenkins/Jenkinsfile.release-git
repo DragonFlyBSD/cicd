@@ -36,7 +36,22 @@ def normalizeBranchName(String branch) {
     return value
 }
 
-def computeTargetVersion(Map branchInfo, String versionBump, String targetVersion) {
+def nextPatchVersion(Map branchInfo, String tagRefs) {
+    int highestPatch = 0
+    tagRefs.eachLine { line ->
+        def fields = line.tokenize()
+        if (fields.size() == 2) {
+            def m = fields[1] =~ /^refs\/tags\/v(\d+)\.(\d+)\.(\d+)$/
+            if (m.matches() && m[0][1].toInteger() == branchInfo.major &&
+                    m[0][2].toInteger() == branchInfo.minor) {
+                highestPatch = Math.max(highestPatch, m[0][3].toInteger())
+            }
+        }
+    }
+    return highestPatch + 1
+}
+
+def computeTargetVersion(Map branchInfo, String versionBump, String targetVersion, String tagRefs) {
     if (targetVersion?.trim()) {
         return parseVersion(targetVersion)
     }
@@ -55,7 +70,7 @@ def computeTargetVersion(Map branchInfo, String versionBump, String targetVersio
         if (branchInfo.kind == 'DEVELOPMENT') {
             error('Patch release from a DEVELOPMENT branch is ambiguous. Set TARGET_VERSION explicitly or use a release branch as BASE_BRANCH.')
         }
-        return [major: major, minor: minor, patch: 1]
+        return [major: major, minor: minor, patch: nextPatchVersion(branchInfo, tagRefs)]
     }
     if (versionBump == 'none') {
         return [major: major, minor: minor, patch: 0]
@@ -221,6 +236,12 @@ EOF
                         export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
                         export GIT_TERMINAL_PROMPT=0
                         git clone --depth 1 --branch "$BASE_BRANCH_NORMALIZED" -- "$ORIGIN_URL" src
+                        # A shallow clone does not contain all release tags.
+                        # Query origin explicitly, with the same credentials, and
+                        # fail on errors rather than computing from missing data.
+                        if [ "$VERSION_BUMP" = "patch" ]; then
+                            git -C src ls-remote --tags --refs origin > origin-tags.txt
+                        fi
                         rm -f git-askpass.sh
                     '''
                 }
@@ -270,7 +291,10 @@ EOF
             steps {
                 script {
                     def branchInfo = readBranchInfo('src')
-                    def target = computeTargetVersion(branchInfo, params.VERSION_BUMP, params.TARGET_VERSION?.trim() ?: '')
+                    String targetOverride = params.TARGET_VERSION?.trim() ?: ''
+                    String tagRefs = params.VERSION_BUMP == 'patch' && !targetOverride
+                        ? readFile('origin-tags.txt') : ''
+                    def target = computeTargetVersion(branchInfo, params.VERSION_BUMP, targetOverride, tagRefs)
 
                     if (target.minor % 2 != 0) {
                         error("Target release minor version must be even, got ${versionString(target)}")
