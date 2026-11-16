@@ -216,9 +216,6 @@ pipeline {
         stage('Validate Parameters') {
             steps {
                 script {
-                    if (!params.DRY_RUN && params.containsKey('RELEASE_TOOLS_COMMIT')) {
-                        error('RELEASE_TOOLS_COMMIT is a protected trust setting; configure it outside Build with Parameters.')
-                    }
                     if (!params.DRY_RUN && !(env.RELEASE_TOOLS_COMMIT ==~ /^[0-9a-f]{40}$/)) {
                         error('RELEASE_TOOLS_COMMIT must be a reviewed full commit ID configured in the job for real runs.')
                     }

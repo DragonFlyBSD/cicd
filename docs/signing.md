@@ -17,10 +17,14 @@ independently before reviewing/committing the public keys. The directory is the
 allowlist; the preflight counts distinct primary keys, not files or subkeys.
 Revoked and expired primary keys do not satisfy that count.
 
-This setting must be protected job/folder/global environment configuration,
-not an editable build parameter. The pipeline rejects a parameter with this
-name. Protect job configuration, Pipeline source and Replay permissions as well:
-a user able to replace the pipeline can replace its enforcement code.
+Configure this as a job-level String Parameter named `RELEASE_TOOLS_COMMIT`, with
+the reviewed hash as its default. Jenkins exports it to the build environment;
+no global variable is required. An environment variable is also supported.
+Anyone allowed to choose this parameter can select the executable verifier and
+key revision, so restrict Build permission to trusted release operators and
+review the selected hash before approval. This pins the build's tools; it is not
+an independently protected trust policy. Protect job configuration, Pipeline
+source and Replay permissions as well.
 
 Jenkins fetches exactly this tools commit and checks out a detached HEAD in
 `tools/`; there is no fallback to a moving branch. It fetches approvals separately

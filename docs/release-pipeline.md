@@ -118,8 +118,10 @@ that they remain present after the first run and restore them in the UI if neede
 
 Before non-dry-runs, an administrator must set `RELEASE_TOOLS_COMMIT` to the
 reviewed full CI/CD commit containing the tools and at least two authorized
-primary public keys. This trust pin must be protected environment configuration,
-not a build parameter; the pipeline rejects editable parameters with that name.
+primary public keys. Add it as a job-level String Parameter with the reviewed
+hash as its default; Jenkins exports it as an environment variable. A global
+setting is not required. Only trusted release operators should be able to choose
+this value, since it selects executable verification tools and authorized keys.
 See `docs/signing.md` for the two-person signing and public approval process.
 
 Configure `BASE_BRANCH` in Jenkins UI as an Active Choices Parameter.

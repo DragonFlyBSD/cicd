@@ -295,9 +295,9 @@ try {
         git(toolsSeed, ['commit', '-m', 'Reviewed tools and two authorized keys'])
         def pin = git(toolsSeed, ['rev-parse', 'HEAD'])
         def signedFixture = createFixture('signed-release')
-        def signedBuild = newBuild(signedFixture, [:], [
+        def signedBuild = newBuild(signedFixture, [RELEASE_TOOLS_COMMIT:pin], [
             RELEASE_TOOLS_URL:toolsSeed.toURI().toString().replaceFirst('^file:/', 'file:///'),
-            RELEASE_TOOLS_COMMIT:pin, RELEASE_APPROVALS_REF:'master',
+            RELEASE_APPROVALS_REF:'master',
             SIGNED_TAG_TIMEOUT_HOURS:'1', SECOND_APPROVAL_TIMEOUT_HOURS:'1',
             PATH:new File(signingPython).parent + ':' + System.getenv('PATH')])
         ['Validate Parameters', 'Clone Origin', 'Checkout Release Tools', 'Compute Release Plan',
@@ -357,7 +357,10 @@ try {
         def badPin = newBuild(createFixture('bad-pin'), [:], [RELEASE_TOOLS_COMMIT:'master'])
         rejects('reviewed full commit ID') { badPin.stage('Validate Parameters') }
         def editablePin = newBuild(createFixture('editable-pin'), [RELEASE_TOOLS_COMMIT:pin])
-        rejects('protected trust setting') { editablePin.stage('Validate Parameters') }
+        editablePin.stage('Validate Parameters')
+        assert editablePin.env.RELEASE_TOOLS_COMMIT == pin
+        def badParameterPin = newBuild(createFixture('bad-parameter-pin'), [RELEASE_TOOLS_COMMIT:'master'])
+        rejects('reviewed full commit ID') { badParameterPin.stage('Validate Parameters') }
     } finally {
         run(root, ['gpgconf', '--homedir', gpgHome.path, '--kill', 'all'])
         assert gpgHome.deleteDir()
