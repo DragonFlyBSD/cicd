@@ -19,6 +19,10 @@ def git = { File directory, List<String> arguments ->
     assert result.status == 0 : "git ${arguments}: ${result.errors}"
     result.output.trim()
 }
+// Emit Signing Request runs the real schema validator as well as the Git stages.
+// Use a Python environment with scripts/requirements-signing.txt installed.
+def signingPython = System.getenv('RELEASE_SIGNING_TEST_PYTHON') ?:
+    run(root, ['python3', '-c', 'import sys; print(sys.executable)']).output.trim()
 def put = { File directory, String path, String content ->
     def file = new File(directory, path)
     file.parentFile.mkdirs()
@@ -64,7 +68,7 @@ def newBuild = { Map fixture, Map overrides = [:] ->
                   VERSION_BUMP:'minor', TARGET_VERSION:'', RELEASE_STAGE:'rc', RC_NUMBER:'1', DRY_RUN:false] + overrides
     def env = [WORKSPACE:workspace.path, GIT_AUTHOR_NAME:'Release Test', GIT_AUTHOR_EMAIL:'release@example.invalid',
                ALLOWED_ORIGIN_PREFIX:fixture.origin.toURI().toString().replaceFirst('^file:/', 'file:///'), GIT_CREDENTIALS_ID:'unused',
-               RELEASE_APPROVERS:'tester', BUILD_TAG:'local-test']
+               RELEASE_APPROVERS:'tester', BUILD_TAG:'local-test', SIGNING_PYTHON:signingPython]
     params.each { key, value -> env[key] = value.toString() }
     def binding = new Binding([params:params, env:env])
     def script = new GroovyShell(binding).parse(pipelineFile)
@@ -101,7 +105,16 @@ def newBuild = { Map fixture, Map overrides = [:] ->
         return arguments instanceof Map && arguments.returnStdout ? result.output : null
     }
     script.run()
-    [workspace:workspace, env:env, params:params, stage:{ String name -> stages[name].call() }]
+    [workspace:workspace, env:env, params:params, stage:{ String name ->
+        stages[name].call()
+        if (name == 'Clone Origin') {
+            // Checkout Release Tools normally supplies these files on Jenkins.
+            ['scripts/release_signing.py', 'scripts/validate-release-signing-request',
+             'schemas/release-signing-request.schema.json'].each { path ->
+                put(workspace, "tools/${path}", new File(pipelineFile.parentFile.parentFile, path).text)
+            }
+        }
+    }]
 }
 def prepare = { Map build ->
     ['Validate Parameters', 'Clone Origin', 'Compute Release Plan', 'Check Remote Refs',

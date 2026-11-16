@@ -40,11 +40,56 @@ emits no request.
    ```
    scripts/verify-release-tag release-signing-request.json
    ```
-   Verification fails closed: an invalid signature, a tag that points at the
-   wrong commit, or a signer outside the authorized set must all reject.
+   Verification fails closed: invalid signatures, unauthorized signers, mismatched
+   internal tag names, and tags not pointing directly at the exact requested
+   commit are rejected.
 
 The script interface (`sign-release-tag` / `verify-release-tag`) is the primary
 path; `tag-command.txt` is the transparent fallback.
+
+### Requirements and request validation
+
+The tag scripts require Git, GPG, Python 3.10 or newer, and `jsonschema` 4.23 or
+newer (below 5). Keep the scripts together with `scripts/release_signing.py` and
+`schemas/release-signing-request.schema.json`; the helper loads the local schema.
+For a signer or local tests, prepare a Python environment and activate it:
+
+```sh
+python3 -m venv /path/to/signing-venv
+. /path/to/signing-venv/bin/activate
+python -m pip install -r scripts/requirements-signing.txt
+python -m unittest discover -s tests -p test_release_signing.py -v
+```
+
+The integration tests generate disposable OpenPGP keys in temporary directories;
+they do not read or modify your personal keyring. They cover authorized signing
+subkeys, final/RC releases, malformed/duplicate JSON, inconsistent fields,
+unauthorized signatures, incorrect commits, unsigned and nested tags, reused tag
+objects, tampered signatures, and repository verification-program overrides.
+
+Both tag scripts parse the request as JSON, reject duplicate fields and control
+characters, and enforce the committed Draft 2020-12 JSON schema. Requests are
+limited to 64 KiB of text. Additional checks require an even release minor and
+agreement between the target version, release branch, tag name, stage, RC number,
+and canonical tag message (`DragonFly x.y.z` or `DragonFly x.y.zrcN`). Final
+requests cannot contain `rc_number`. Validation happens before signing or tag
+verification. To check a request without accessing Git or signing keys:
+
+```sh
+scripts/validate-release-signing-request release-signing-request.json
+```
+
+Jenkins serializes requests using a JSON encoder and validates them before
+archiving. Its early *Checkout Release Tools* stage checks Python/GPG availability
+and explicitly uses Python 3.12, installing missing DragonFly binary packages
+(`python312`, `gnupg`, and `py312-jsonschema`). It invokes `python3.12` regardless
+of the system default. This avoids building
+Python dependencies from source on the worker and runs before branch pushes.
+The worker needs package installation permission when dependencies are absent.
+
+The signer's independent repository/source review and explicit key selection are
+still manual; request validation does not establish that the requested source is
+safe to release.
 
 ### Authorized signers (the allowlist)
 
@@ -54,6 +99,19 @@ into a throwaway keyring, verifies the tag against that keyring, and then
 requires the signing key's primary fingerprint to be one of those keys. The
 directory **is** the allowlist; override its location with
 `AUTHORIZED_SIGNERS_DIR`.
+
+Only primary public-key fingerprints are allowlisted; signatures by their
+signing subkeys are mapped back to the primary fingerprint. Verification uses
+an isolated temporary GPG home and explicitly selects GPG/OpenPGP so repository
+configuration cannot substitute another verification program. Invalid, expired,
+or revoked signature/key status fails verification.
+
+The verifier resolves the requested tag ref once and checks that immutable tag
+object throughout. It requires an annotated tag, the signed object's internal
+`tag` header to match `release_tag`, and its direct object/type headers to name
+the requested commit. A signed RC tag copied under a final tag ref is therefore
+rejected, even if it targets the same commit. Nested tags are rejected. Git
+replacement objects are disabled for these checks.
 
 This fails closed: if the directory has no keys, verification rejects
 everything. See `keys/authorized-signers/README.md`. The final production
@@ -104,12 +162,12 @@ stage('Await Signed Tag') {
 Notes:
 - This is implemented in `jenkins/Jenkinsfile.release-git` (stages *Commit And
   Push Branches* → *Emit Signing Request* → *Await Signed Tag*). Because that job
-  is an inline pipeline that only checks out the source repo, it clones **this**
+  keeps release tooling separate from its source checkout, it clones **this**
   repo to `tools/` on the agent and runs `tools/scripts/verify-release-tag` with
   `AUTHORIZED_SIGNERS_DIR=tools/keys/authorized-signers`.
 - The agent only needs the authorized **public** keys (from `keys/`), never a
   private key — so the whole wait happens with no signing material on the worker.
-- A present tag that does not verify (bad signature, unauthorized signer, or
+- A present tag that does not verify (bad signature, unauthorized signer, mismatched internal name, or
   wrong commit) is treated as a **hard failure**, not a reason to keep waiting.
   Only a not-yet-present tag keeps the loop polling; the surrounding `timeout`
   bounds that wait.
@@ -164,9 +222,9 @@ the open question below.
 - Final authorized production signing key(s) are **not yet decided**. The
   allowlist mechanism is in place (`keys/authorized-signers/*.asc`), but no keys
   are committed, so verification fails closed until they are chosen and added.
-- Whether the signer hands back a pushed tag, an exported tag object, or a
-  detached signature is not yet decided (see TODO in `scripts/sign-release-tag`).
-  The poll-based wait above assumes the signer **pushes** the tag to origin.
+- The signer pushes the signed tag to origin; the pipeline polls for it.
+- Verification tooling and keys still come from the configured tools branch.
+  Pinning that trust configuration to a reviewed revision is a separate follow-up.
 - The poll timeout (`SIGNED_TAG_TIMEOUT_HOURS`, default 3h) and poll interval are
   tunable.
 - Artifact/image signing is wired as skeletons; it activates once the build

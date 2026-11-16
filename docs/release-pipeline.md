@@ -92,8 +92,9 @@ Agent package requirements:
 
 ```text
 git must already be available.
-gpg is required only for non-dry-run signed tags.
-On DragonFly agents, install missing gpg with: pkg install -y gnupg
+Non-dry-runs use GPG, Python 3.12, and jsonschema (4.23+, below 5).
+Checkout Release Tools installs missing DragonFly binary packages before pushes.
+See docs/signing.md for package names and signer/test environment setup.
 ```
 
 ## Jenkins Job Setup
@@ -179,7 +180,10 @@ For a nonzero patch version (e.g. promoting `6.4.3rc1` to `6.4.3`), also set
 `TARGET_VERSION=6.4.3`. This path changes no source files and never updates
 master. New minor/major branch creation is not repeated.
 
-Run the checks from the repository root (requires Groovy and a Java runtime):
+Run the checks from the repository root (requires Groovy, a Java runtime, and
+Python with scripts/requirements-signing.txt installed). If using a separate
+Python environment, set RELEASE_SIGNING_TEST_PYTHON to its absolute interpreter
+path for the workflow checks:
 
 ```sh
 groovy tests/release-version.groovy

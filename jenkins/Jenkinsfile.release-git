@@ -234,6 +234,9 @@ pipeline {
                         error("BASE_BRANCH parameter failed to populate: ${params.BASE_BRANCH}")
                     }
                     env.BASE_BRANCH_NORMALIZED = normalizeBranchName(params.BASE_BRANCH)
+                    if (!(params.RELEASE_STAGE in ['rc', 'final'])) {
+                        error("Unsupported RELEASE_STAGE '${params.RELEASE_STAGE}'")
+                    }
                     if (params.RELEASE_STAGE == 'rc' && !(params.RC_NUMBER ==~ /^[1-9][0-9]*$/)) {
                         error("RC_NUMBER must be a positive integer, got '${params.RC_NUMBER}'")
                     }
@@ -311,9 +314,28 @@ EOF
                         echo "otherwise the pushed tag could never pass verification." >&2
                         exit 1
                     fi
+                    # Prepare and check verification dependencies before any
+                    # branch writes. Use DragonFly binary packages, avoiding a
+                    # pip source build of jsonschema's Rust dependencies on workers.
+                    # Select 3.12 explicitly rather than relying on the default.
+                    if ! command -v python3.12 >/dev/null 2>&1; then
+                        pkg install -y python312
+                    fi
+                    if ! command -v gpg >/dev/null 2>&1; then
+                        pkg install -y gnupg
+                    fi
+                    if ! python3.12 -c 'from jsonschema import Draft202012Validator' >/dev/null 2>&1; then
+                        pkg install -y py312-jsonschema
+                    fi
+                    python3.12 -c 'import json; from jsonschema import Draft202012Validator; Draft202012Validator.check_schema(json.load(open("tools/schemas/release-signing-request.schema.json")))'
+                    command -v gpg >/dev/null
+
                     echo "Authorized signer keys present:"
                     for k in tools/keys/authorized-signers/*.asc; do echo "  $k"; done
                 '''
+                script {
+                    env.SIGNING_PYTHON = sh(returnStdout: true, script: 'command -v python3.12').trim()
+                }
             }
         }
 
@@ -612,26 +634,30 @@ EOF
                 expression { return !params.DRY_RUN }
             }
             steps {
+                script {
+                    def request = [
+                        schema_version: '1',
+                        release_tag: env.RELEASE_TAG,
+                        release_branch: env.RELEASE_BRANCH,
+                        target_version: env.TARGET_VERSION_COMPUTED,
+                        release_stage: params.RELEASE_STAGE,
+                        commit: env.RELEASE_COMMIT,
+                        tag_message: env.RELEASE_LABEL,
+                        origin_url: params.ORIGIN_URL,
+                        created: sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M:%SZ').trim(),
+                        jenkins_build: env.BUILD_TAG
+                    ]
+                    if (params.RELEASE_STAGE == 'rc') {
+                        request.rc_number = params.RC_NUMBER
+                    }
+                    writeFile(file: 'release-signing-request.json',
+                        text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(request)) + '\n')
+                }
                 sh '''
                     set -eu
-                    created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-                    {
-                        printf '{\n'
-                        printf '  "schema_version": "1",\n'
-                        printf '  "release_tag": "%s",\n' "$RELEASE_TAG"
-                        printf '  "release_branch": "%s",\n' "$RELEASE_BRANCH"
-                        printf '  "target_version": "%s",\n' "$TARGET_VERSION_COMPUTED"
-                        printf '  "release_stage": "%s",\n' "$RELEASE_STAGE"
-                        if [ "$RELEASE_STAGE" = "rc" ]; then
-                            printf '  "rc_number": "%s",\n' "$RC_NUMBER"
-                        fi
-                        printf '  "commit": "%s",\n' "$RELEASE_COMMIT"
-                        printf '  "tag_message": "%s",\n' "$RELEASE_LABEL"
-                        printf '  "origin_url": "%s",\n' "$ORIGIN_URL"
-                        printf '  "created": "%s",\n' "$created"
-                        printf '  "jenkins_build": "%s"\n' "$BUILD_TAG"
-                        printf '}\n'
-                    } > release-signing-request.json
+                    "$SIGNING_PYTHON" \
+                        "$WORKSPACE/tools/scripts/validate-release-signing-request" \
+                        "$WORKSPACE/release-signing-request.json"
 
                     cat > tag-command.txt <<EOF
 # DragonFly release tag signing request
@@ -649,21 +675,6 @@ EOF
 EOF
                 '''
                 archiveArtifacts artifacts: 'release-signing-request.json,tag-command.txt', allowEmptyArchive: false
-            }
-        }
-
-        stage('Install GPG (verify)') {
-            when {
-                expression { return !params.DRY_RUN }
-            }
-            steps {
-                sh '''
-                    set -eu
-                    if ! command -v gpg >/dev/null 2>&1; then
-                        pkg install -y gnupg
-                    fi
-                    command -v gpg >/dev/null
-                '''
             }
         }
 
@@ -726,7 +737,7 @@ EOF
                                     set -eu
                                     cd "$WORKSPACE/src"
                                     AUTHORIZED_SIGNERS_DIR="$WORKSPACE/tools/keys/authorized-signers" \
-                                        "$WORKSPACE/tools/scripts/verify-release-tag" \
+                                        "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/verify-release-tag" \
                                         "$WORKSPACE/release-signing-request.json"
                                 ''')
                                 if (rc != 0) {

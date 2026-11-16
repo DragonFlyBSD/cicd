@@ -1,62 +1,38 @@
-#!/bin/sh
-# sign-release-tag - create a signed DragonFly release tag from a signing request.
-#
-# Usage: sign-release-tag release-signing-request.json
-#
-# Run by an authorized signer on their own machine, off the Jenkins host, using
-# the signer's own GPG key. No Jenkins-held key is involved. Must be run from
-# inside the release git working tree (or set GIT_DIR/--git-dir appropriately).
-#
-# Skeleton: deliberately minimal. JSON parsing is sed-based to avoid a jq/python
-# dependency on the DragonFly base system; swap json_get() for jq later if a
-# dependency becomes acceptable.
+#!/usr/bin/env python3
+"""Create a signed release tag locally; never upload private signing material."""
 
-set -eu
+import subprocess
+import sys
 
-die() { echo "sign-release-tag: $*" >&2; exit 1; }
+from release_signing import SigningError, git, load_request, require_commit
 
-# Extract a flat top-level string field from a JSON object. Handles the shapes
-# this pipeline emits ("key": "value"); not a general JSON parser.
-json_get() {
-    # $1 = file, $2 = key
-    sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n1
-}
 
-[ $# -eq 1 ] || die "usage: sign-release-tag release-signing-request.json"
-request="$1"
-[ -f "$request" ] || die "request file not found: $request"
+def main():
+    if len(sys.argv) != 2:
+        raise SigningError("usage: sign-release-tag release-signing-request.json")
+    request = load_request(sys.argv[1])
+    tag = request["release_tag"]
+    commit = request["commit"]
+    git("rev-parse", "--git-dir")
+    require_commit(commit)
+    existing = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/tags/{tag}"]
+    )
+    if existing.returncode == 0:
+        raise SigningError(f"tag already exists locally: {tag}")
+    if existing.returncode != 1:
+        raise SigningError("cannot check existing tag")
 
-release_tag=$(json_get "$request" release_tag)
-commit=$(json_get "$request" commit)
-tag_message=$(json_get "$request" tag_message)
+    # Use the signer's locally configured OpenPGP key. Key selection/review UI
+    # is intentionally unchanged here; never sign automatically on Jenkins.
+    git("-c", "gpg.format=openpgp", "tag", "-s", "-m", request["tag_message"], tag, commit)
+    print(f"Created signed tag {tag} -> {commit}")
+    print(git("--no-pager", "show", "--no-patch", f"refs/tags/{tag}").decode(), end="")
+    print(f"After review, push with: git push origin refs/tags/{tag}:refs/tags/{tag}")
 
-[ -n "$release_tag" ] || die "release_tag missing from request"
-[ -n "$commit" ] || die "commit missing from request"
-[ -n "$tag_message" ] || die "tag_message missing from request"
 
-# Sanity-check shapes before touching git.
-echo "$release_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$' \
-    || die "release_tag has unexpected shape: $release_tag"
-echo "$commit" | grep -Eq '^[0-9a-f]{40}$' \
-    || die "commit is not a 40-hex object id: $commit"
-
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-    || die "not inside a git working tree (cd into the release source tree first)"
-git cat-file -e "$commit" 2>/dev/null \
-    || die "commit not present in this repository: $commit"
-
-if git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null; then
-    die "tag already exists locally: $release_tag"
-fi
-
-# Sign with the signer's own default key. git uses user.signingkey / gpg config.
-git tag -s -m "$tag_message" "$release_tag" "$commit"
-
-echo "Created signed tag $release_tag -> $commit"
-git --no-pager show --no-patch "$release_tag"
-
-# TODO: decide the handoff format back to Jenkins. Options:
-#   - push the tag to origin directly,
-#   - export the tag object (git cat-file tag "$release_tag"),
-#   - produce a detached signature.
-# Left undecided on purpose; do not invent a transport here yet.
+if __name__ == "__main__":
+    try:
+        main()
+    except (SigningError, OSError) as exc:
+        sys.exit(f"sign-release-tag: {exc}")

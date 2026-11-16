@@ -27,6 +27,7 @@ docs/
 scripts/
   sign-release-tag                     Create a signed release tag from a request.
   verify-release-tag                   Verify a signed tag against its request.
+  validate-release-signing-request      Validate request schema and release fields.
   sign-release-artifacts               Build + sign a sha256 CHECKSUM manifest.
   verify-release-artifacts             Verify the manifest signature and hashes.
 schemas/

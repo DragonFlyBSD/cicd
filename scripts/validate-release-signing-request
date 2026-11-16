@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Validate a release signing request without accessing Git or private keys."""
+
+import sys
+from release_signing import SigningError, load_request
+
+if __name__ == '__main__':
+    try:
+        if len(sys.argv) != 2:
+            raise SigningError('usage: validate-release-signing-request release-signing-request.json')
+        request = load_request(sys.argv[1])
+        print(f"OK: signing request for {request['release_tag']} at {request['commit']}")
+    except SigningError as exc:
+        sys.exit(f'validate-release-signing-request: {exc}')
