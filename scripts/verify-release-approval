@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Require an authorized signed tag and a second authorized primary-key approval."""
+import argparse
+import json
+from pathlib import Path
+import sys
+from release_signing import SigningError, load_request
+from release_approval import verify_approval
+
+if __name__ == '__main__':
+    try:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('--report', help='write successful verification evidence as JSON')
+        parser.add_argument('request')
+        parser.add_argument('approval_directory')
+        args = parser.parse_args()
+        result = verify_approval(load_request(args.request), args.approval_directory)
+        if args.report:
+            Path(args.report).write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+        print(f"OK: {result['release_tag']} approved by {result['tag_signer']} and {result['second_signer']}")
+    except (SigningError, OSError, UnicodeError) as exc:
+        sys.exit(f'verify-release-approval: {exc}')

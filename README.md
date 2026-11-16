@@ -27,11 +27,16 @@ docs/
 scripts/
   sign-release-tag                     Create a signed release tag from a request.
   verify-release-tag                   Verify a signed tag against its request.
+  approve-release                      Review and create the second public approval.
+  verify-release-approval               Enforce two different authorized primary keys.
+  fetch-release-approval                Fetch only approval data from a moving branch.
   validate-release-signing-request      Validate request schema and release fields.
   sign-release-artifacts               Build + sign a sha256 CHECKSUM manifest.
   verify-release-artifacts             Verify the manifest signature and hashes.
 schemas/
   release-signing-request.schema.json  Schema for the signing request document.
+  release-approval.schema.json         Schema for the second approval manifest.
+approvals/                            Public manifests and detached second signatures.
 keys/
   authorized-signers/                  Public keys of authorized release signers
                                        (the verification allowlist).
@@ -41,5 +46,5 @@ keys/
 
 - `docs/release-pipeline.md` — what the pipeline does, parameters, stages, and
   guardrails.
-- `docs/signing.md` — how release tags are signed today and the direction toward
-  signing outside Jenkins.
+- `docs/signing.md` — two-person release signing, pinned trust configuration,
+  and public approvals.

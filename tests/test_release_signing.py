@@ -34,6 +34,10 @@ class ReleaseSigningTests(unittest.TestCase):
         cls.gpg('--quick-generate-key', 'Authorized Test <authorized@example.invalid>', 'ed25519', 'cert', '0')
         cls.authorized = cls.fingerprint()
         cls.gpg('--quick-add-key', cls.authorized, 'ed25519', 'sign', '0')
+        cls.gpg('--quick-add-key', cls.authorized, 'ed25519', 'sign', '0')
+        cls.signing_subkeys = [line.split(':')[9] for line in
+                               cls.gpg('--with-colons', '--list-keys', cls.authorized).stdout.decode().splitlines()
+                               if line.startswith('fpr:')][1:]
         cls.gpg('--quick-generate-key', 'Other Test <other@example.invalid>', 'ed25519', 'sign', '0')
         listing = cls.gpg('--with-colons', '--list-keys').stdout.decode()
         fingerprints = []
@@ -81,18 +85,30 @@ class ReleaseSigningTests(unittest.TestCase):
                             target_version='6.6.0', release_stage='final', commit=self.commit,
                             tag_message='DragonFly 6.6.0')
         self.path = self.repo / 'signing request.json'
+        self.origin = Path(self.temp.name) / 'origin.git'
+        self.run_git('init', '--bare', str(self.origin))
+        self.run_git('remote', 'add', 'origin', self.origin.as_uri())
+        self.run_git('push', 'origin', f'HEAD:refs/heads/{self.request["release_branch"]}')
+        self.request['origin_url'] = self.origin.as_uri()
+
 
     def run_git(self, *arguments, input=None):
         return subprocess.run(['git', *arguments], cwd=self.repo, env=self.env,
                               input=input, capture_output=True, check=True)
 
-    def cli(self, script, request=None, *, raw=None, succeeds=True, contains=None):
+    def cli(self, script, request=None, *, raw=None, succeeds=True, contains=None, extra=(), confirmation=None):
         if raw is not None:
             self.path.write_text(raw)
         else:
             self.path.write_text(json.dumps(self.request if request is None else request))
         env = dict(self.env, AUTHORIZED_SIGNERS_DIR=str(self.keys))
-        result = subprocess.run([sys.executable, str(SCRIPTS / script), str(self.path)],
+        arguments = [sys.executable, str(SCRIPTS / script)]
+        if script == 'sign-release-tag':
+            arguments += ['--key', self.authorized, '--origin', self.origin.as_uri()]
+        arguments.append(str(self.path))
+        arguments.extend(extra)
+        effective = self.request if request is None else request
+        result = subprocess.run(arguments, input=(effective.get('release_tag', '') if confirmation is None else confirmation) + '\n',
                                 cwd=self.repo, env=env, capture_output=True, text=True)
         if succeeds:
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -122,8 +138,7 @@ class ReleaseSigningTests(unittest.TestCase):
         self.cli('verify-release-tag', contains=f'signer {self.other}')
 
     def test_valid_json_escaping_and_optional_metadata(self):
-        self.request.update(origin_url='https://example.invalid/a?name="release"',
-                            jenkins_build='release "test"', created='2026-11-16T00:00:00Z')
+        self.request.update(jenkins_build='release "test"', created='2026-11-16T00:00:00Z')
         self.cli('validate-release-signing-request')
         self.cli('sign-release-tag')
         self.cli('verify-release-tag')
@@ -239,7 +254,8 @@ class ReleaseSigningTests(unittest.TestCase):
 
     def test_reject_non_commit_request_object(self):
         blob = self.run_git('hash-object', 'source').stdout.decode().strip()
-        self.cli('sign-release-tag', dict(self.request, commit=blob), succeeds=False, contains='not a commit')
+        self.cli('sign-release-tag', dict(self.request, commit=blob), succeeds=False, contains='remote release branch tip')
+        self.cli('verify-release-tag', dict(self.request, commit=blob), succeeds=False, contains='not a commit')
 
     def test_reject_oversized_request(self):
         self.cli('sign-release-tag', raw=' ' * 65537, succeeds=False, contains='exceeds 64 KiB')
@@ -277,6 +293,206 @@ class ReleaseSigningTests(unittest.TestCase):
                                 cwd=self.repo, env=self.env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('cannot read signing request', result.stderr)
+
+    def prepare_two_person_release(self):
+        (self.keys / 'second.asc').write_bytes(self.gpg('--armor', '--export', self.other).stdout)
+        self.cli('sign-release-tag')
+        self.run_git('push', 'origin', 'refs/tags/v6.6.0')
+        self.approvals = Path(self.temp.name) / 'approvals'
+        self.approval = self.approvals / 'v6.6.0'
+
+    def approve(self, key=None, **kwargs):
+        return self.cli('approve-release', extra=[
+            '--key', key or self.other, '--origin', self.origin.as_uri(),
+            '--output-dir', str(self.approvals)], **kwargs)
+
+    def verify_pair(self, **kwargs):
+        return self.cli('verify-release-approval', extra=[str(self.approval)], **kwargs)
+
+    def resign_approval(self, key=None):
+        self.gpg('--yes', '--armor', '--detach-sign', '--local-user', key or self.other,
+                 '--output', str(self.approval / 'second-signature.asc'), str(self.approval / 'release.json'))
+
+    def test_two_authorized_people_approve_same_tag(self):
+        self.prepare_two_person_release()
+        self.approve()
+        result = self.verify_pair()
+        self.assertIn(self.authorized, result.stdout)
+        self.assertIn(self.other, result.stdout)
+        manifest = json.loads((self.approval / 'release.json').read_text())
+        self.assertEqual(manifest['tag_object'], self.run_git('rev-parse', 'refs/tags/v6.6.0').stdout.decode().strip())
+        self.assertEqual(manifest['origin_url'], self.origin.as_uri())
+
+    def test_second_approver_cannot_use_first_primary_key(self):
+        self.prepare_two_person_release()
+        self.approve(key=self.authorized, succeeds=False, contains='different authorized primary key')
+        self.assertFalse(self.approval.exists())
+
+    def test_verifier_rejects_second_signature_from_first_primary_key(self):
+        self.prepare_two_person_release()
+        self.approve()
+        self.resign_approval(self.authorized)
+        self.verify_pair(succeeds=False, contains='different authorized primary key')
+
+    def test_two_subkeys_of_one_primary_do_not_count_as_two_signers(self):
+        (self.keys / 'second.asc').write_bytes(self.gpg('--armor', '--export', self.other).stdout)
+        self.assertEqual(len(self.signing_subkeys), 2)
+        self.signed_tag(key=self.signing_subkeys[0] + '!')
+        self.run_git('push', 'origin', 'refs/tags/v6.6.0')
+        self.approvals = Path(self.temp.name) / 'approvals'
+        self.approval = self.approvals / 'v6.6.0'
+        self.approve()
+        self.resign_approval(self.signing_subkeys[1] + '!')
+        self.verify_pair(succeeds=False, contains='different authorized primary key')
+
+    def test_valid_signature_cannot_approve_another_release_or_repository(self):
+        self.prepare_two_person_release()
+        self.approve()
+        original = json.loads((self.approval / 'release.json').read_text())
+        for field, value in [('origin_url', 'https://other.invalid/source'),
+                             ('release_branch', 'DragonFly_RELEASE_6_4'),
+                             ('release_tag', 'v6.4.0'), ('commit', 'a'*40), ('tag_object', 'b'*40)]:
+            with self.subTest(field=field):
+                (self.approval / 'release.json').write_text(json.dumps(dict(original, **{field:value})))
+                self.resign_approval()
+                self.verify_pair(succeeds=False, contains='manifest does not match')
+
+    def test_approval_rejects_tampered_signature_and_missing_files(self):
+        self.prepare_two_person_release()
+        self.approve()
+        signature = self.approval / 'second-signature.asc'
+        signature.write_bytes(signature.read_bytes().replace(b'BEGIN PGP', b'BEGIN XXX'))
+        self.verify_pair(succeeds=False, contains='signature did not verify')
+        signature.unlink()
+        self.verify_pair(succeeds=False)
+
+    def test_approval_schema_and_duplicate_fields_are_enforced(self):
+        self.prepare_two_person_release()
+        self.approve()
+        original = json.loads((self.approval / 'release.json').read_text())
+        for updates in ({'schema_version':'2'}, {'kind':'unrelated-approval'}, {'unknown':'field'}):
+            with self.subTest(updates=updates):
+                (self.approval / 'release.json').write_text(json.dumps(dict(original, **updates)))
+                self.resign_approval()
+                self.verify_pair(succeeds=False, contains='schema')
+        (self.approval / 'release.json').write_text('{"schema_version":"1","schema_version":"1"}')
+        self.resign_approval()
+        self.verify_pair(succeeds=False, contains='duplicate JSON field')
+
+    def test_unauthorized_second_signer_is_rejected(self):
+        self.prepare_two_person_release()
+        self.approve()
+        identity = 'Outsider Test <outsider@example.invalid>'
+        self.gpg('--quick-generate-key', identity, 'ed25519', 'sign', '0')
+        listing = self.gpg('--with-colons', '--list-keys', identity).stdout.decode()
+        outsider = next(line.split(':')[9] for line in listing.splitlines() if line.startswith('fpr:'))
+        self.resign_approval(outsider)
+        self.verify_pair(succeeds=False, contains='signature did not verify')
+
+    def test_second_approver_does_not_overwrite_approval(self):
+        self.prepare_two_person_release()
+        self.approve()
+        before = (self.approval / 'second-signature.asc').read_bytes()
+        self.approve(succeeds=False, contains='already exists')
+        self.assertEqual((self.approval / 'second-signature.asc').read_bytes(), before)
+
+    def test_second_approver_uses_remote_tag_without_overwriting_local_tag(self):
+        self.prepare_two_person_release()
+        remote_oid = self.run_git('rev-parse', 'refs/tags/v6.6.0').stdout.decode().strip()
+        self.signed_tag(name='v6.4.9')
+        stale_oid = self.run_git('rev-parse', 'refs/tags/v6.4.9').stdout.decode().strip()
+        self.run_git('update-ref', 'refs/tags/v6.6.0', stale_oid)
+        self.approve()
+        self.assertEqual(json.loads((self.approval / 'release.json').read_text())['tag_object'], remote_oid)
+        self.assertEqual(self.run_git('rev-parse', 'refs/tags/v6.6.0').stdout.decode().strip(), stale_oid)
+
+    def test_signer_requires_exact_confirmation(self):
+        self.cli('sign-release-tag', confirmation='no', succeeds=False, contains='confirmation did not match')
+        self.assertEqual(self.run_git('tag', '--list').stdout, b'')
+
+    def test_signer_requires_explicit_key_and_expected_origin(self):
+        self.path.write_text(json.dumps(self.request))
+        result = subprocess.run([sys.executable, str(SCRIPTS / 'sign-release-tag'), str(self.path)],
+                                cwd=self.repo, env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--key', result.stderr)
+        self.assertIn('--origin', result.stderr)
+
+    def test_signer_rejects_request_or_local_origin_mismatch(self):
+        self.cli('sign-release-tag', dict(self.request, origin_url='https://other.invalid/source'),
+                 succeeds=False, contains='explicitly expected --origin')
+        self.run_git('remote', 'set-url', 'origin', 'https://other.invalid/source')
+        self.cli('sign-release-tag', succeeds=False, contains='local origin')
+
+    def test_signer_rejects_wrong_remote_release_tip(self):
+        self.run_git('-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'New tip')
+        self.run_git('push', 'origin', 'HEAD:refs/heads/DragonFly_RELEASE_6_6')
+        self.cli('sign-release-tag', succeeds=False, contains='remote release branch tip')
+
+    def test_subkey_fingerprint_is_not_accepted_as_explicit_primary(self):
+        self.cli('sign-release-tag', extra=['--key', self.signing_subkeys[0]],
+                 succeeds=False, contains='not a subkey')
+
+    def test_branch_change_during_confirmation_prevents_signing(self):
+        self.path.write_text(json.dumps(self.request))
+        env = dict(self.env, AUTHORIZED_SIGNERS_DIR=str(self.keys))
+        process = subprocess.Popen([sys.executable, str(SCRIPTS / 'sign-release-tag'),
+            '--key', self.authorized, '--origin', self.origin.as_uri(), str(self.path)],
+            cwd=self.repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        try:
+            seen = ''
+            while 'to sign this exact release:' not in seen and len(seen) < 20000:
+                character = process.stdout.read(1)
+                if not character:
+                    break
+                seen += character
+            self.assertIn('to sign this exact release:', seen)
+            self.run_git('-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'Concurrent update')
+            self.run_git('push', 'origin', 'HEAD:refs/heads/DragonFly_RELEASE_6_6')
+            _, errors = process.communicate('v6.6.0\n', timeout=10)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn('remote release branch tip', errors)
+            self.assertEqual(self.run_git('tag', '--list').stdout, b'')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_review_escapes_terminal_control_characters(self):
+        self.run_git('-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', '\x1b[31mUntrusted title')
+        self.commit = self.run_git('rev-parse', 'HEAD').stdout.decode().strip()
+        self.request['commit'] = self.commit
+        self.run_git('push', 'origin', 'HEAD:refs/heads/DragonFly_RELEASE_6_6')
+        result = self.cli('sign-release-tag')
+        self.assertNotIn('\x1b', result.stdout)
+        self.assertIn('\\x1b', result.stdout)
+
+    def test_previous_release_summary(self):
+        self.run_git('tag', 'v6.4.2', self.commit)
+        self.run_git('tag', 'v6.5.0', self.commit)
+        self.run_git('push', 'origin', 'refs/tags/v6.4.2', 'refs/tags/v6.5.0')
+        (self.repo / 'source').write_text('New release source\n')
+        self.run_git('add', 'source')
+        self.run_git('-c', 'commit.gpgsign=false', 'commit', '-m', 'Release changes')
+        self.commit = self.run_git('rev-parse', 'HEAD').stdout.decode().strip()
+        self.request['commit'] = self.commit
+        self.run_git('push', 'origin', 'HEAD:refs/heads/DragonFly_RELEASE_6_6')
+        self.cli('sign-release-tag', extra=['--previous-tag', 'v6.5.0'],
+                 succeeds=False, contains='earlier final release')
+        self.cli('sign-release-tag', contains='Comparison release: v6.4.2')
+
+    def test_policy_counts_primary_keys_not_files_or_subkeys(self):
+        (self.keys / 'duplicate.asc').write_bytes(self.public)
+        env = dict(self.env, AUTHORIZED_SIGNERS_DIR=str(self.keys))
+        result = subprocess.run([sys.executable, str(SCRIPTS / 'check-release-signing-policy')],
+                                cwd=self.repo, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('2 distinct authorized primary keys', result.stderr)
+        (self.keys / 'second.asc').write_bytes(self.gpg('--armor', '--export', self.other).stdout)
+        result = subprocess.run([sys.executable, str(SCRIPTS / 'check-release-signing-policy')],
+                                cwd=self.repo, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Extract only public approval blobs from a moving ref; never check out its code.
+
+Exit 2 means that the approval pair has not been published yet. Other failures
+are fatal, including failed fetches, symlinks, malformed trees or oversized data.
+"""
+import argparse
+from pathlib import Path
+import re
+import sys
+from release_signing import SigningError, git
+
+
+def fetch_approval(repository, branch, tag, output):
+    if not re.fullmatch(r'v\d+\.\d+\.\d+(rc[1-9][0-9]*)?', tag):
+        raise SigningError('invalid release tag')
+    prefix = ('--git-dir', str(repository))
+    git('check-ref-format', f'refs/heads/{branch}')
+    git(*prefix, 'fetch', '--depth', '1', 'origin', f'refs/heads/{branch}')
+    revision = git(*prefix, 'rev-parse', 'FETCH_HEAD').decode().strip()
+    blobs = {}
+    for name in ('release.json', 'second-signature.asc'):
+        path = f'approvals/{tag}/{name}'
+        entry = git(*prefix, 'ls-tree', '-z', revision, '--', path)
+        if not entry:
+            return False
+        record, filename = entry.rstrip(b'\0').split(b'\t', 1)
+        mode, kind, oid = record.split()
+        if mode != b'100644' or kind != b'blob' or filename != path.encode():
+            raise SigningError(f'approval must be a regular non-executable file: {path}')
+        if int(git(*prefix, 'cat-file', '-s', oid.decode())) > 65536:
+            raise SigningError(f'approval file exceeds 64 KiB: {path}')
+        blobs[name] = git(*prefix, 'cat-file', 'blob', oid.decode())
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    for name, content in blobs.items():
+        (output / name).write_bytes(content)
+    (output / 'source-commit.txt').write_text(revision + '\n', encoding='ascii')
+    return True
+
+
+if __name__ == '__main__':
+    try:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('--git-dir', required=True)
+        parser.add_argument('--ref', default='master')
+        parser.add_argument('--tag', required=True)
+        parser.add_argument('--output', required=True)
+        args = parser.parse_args()
+        if not fetch_approval(args.git_dir, args.ref, args.tag, args.output):
+            print(f'Approval for {args.tag} is not complete yet.')
+            sys.exit(2)
+    except (SigningError, OSError, ValueError, UnicodeError) as exc:
+        sys.exit(f'fetch-release-approval: {exc}')

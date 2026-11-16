@@ -1,182 +1,183 @@
-# Release Signing
+# Release signing
 
-This document describes how DragonFly release tags (and, later, release
-artifacts) are signed.
+A release requires two independent authorized primary GPG keys: one signs the
+Git tag; the other signs a public approval manifest binding the exact signed tag
+object to the source repository and commit. Jenkins never receives private keys.
+Assign the authorized keys to different maintainers; cryptography distinguishes
+primary keys, not the humans who control them. Different subkeys of one primary
+key do not count as two signers.
 
-## Model: sign outside Jenkins
+## Trust configuration
 
-`jenkins/Jenkinsfile.release-git` does **not** sign in Jenkins and holds no
-signing private key. It commits and pushes the release branches, emits a signing
-request, and then waits for an authorized signer to push the signed tag, which
-it verifies before the build completes. Scope is release **tags** now, and
-release **artifacts/images** (`.iso` / `.img` plus checksums) later, once a build
-workflow exists — same out-of-Jenkins pattern (see "Signing release artifacts").
+Before a real run, an administrator configures `RELEASE_TOOLS_COMMIT` as the full
+40-character hash of a reviewed commit in this CI/CD repository. That commit
+must contain the current tools, schemas, and public keys for at least two
+independent signers under `keys/authorized-signers/*.asc`. Verify fingerprints
+independently before reviewing/committing the public keys. The directory is the
+allowlist; the preflight counts distinct primary keys, not files or subkeys.
+Revoked and expired primary keys do not satisfy that count.
 
-Tags are **always** signed and verified against an allowlist; the pipeline never
-accepts an unsigned or unauthorized tag. In dry-run mode it pushes nothing and
-emits no request.
+This setting must be protected job/folder/global environment configuration,
+not an editable build parameter. The pipeline rejects a parameter with this
+name. Protect job configuration, Pipeline source and Replay permissions as well:
+a user able to replace the pipeline can replace its enforcement code.
 
-> Historical note: an earlier rehearsal pipeline signed tags inside Jenkins
-> using `release-rehersal-gpg-private-key` / `release-rehersal-gpg-passphrase`
-> credentials. That approach is retired here; those credentials are no longer
-> used by `Jenkinsfile.release-git`.
+Jenkins fetches exactly this tools commit and checks out a detached HEAD in
+`tools/`; there is no fallback to a moving branch. It fetches approvals separately
+from `RELEASE_APPROVALS_REF` (currently `master`) into a bare `approval-data.git`
+repository using the same CI/CD URL. It extracts only the two approval blobs;
+it never executes scripts or loads keys from the approval branch. New approval
+commits therefore cannot change the pinned verification rules. Updating trusted
+tools or authorized keys requires reviewing a new commit and deliberately
+updating `RELEASE_TOOLS_COMMIT`.
 
-### Flow
+Dry runs do not require a pin, signers or signatures, and publish nothing.
 
-1. Jenkins emits, as build artifacts:
-   - `release-signing-request.json` — the machine interface, validated against
-     `schemas/release-signing-request.schema.json`.
-   - `tag-command.txt` — a transparent, human-readable fallback containing the
-     exact `git tag -s ...` invocation. Useful when the script is unavailable
-     and as an auditable record of what is being signed.
-2. An authorized signer, on their own machine, runs:
-   ```
-   scripts/sign-release-tag release-signing-request.json
-   ```
-   This creates the signed tag with the signer's own key — no Jenkins key
-   involved.
-3. The signer pushes the signed tag back to origin. Jenkins detects it and
-   verifies before doing anything else with it:
-   ```
-   scripts/verify-release-tag release-signing-request.json
-   ```
-   Verification fails closed: invalid signatures, unauthorized signers, mismatched
-   internal tag names, and tags not pointing directly at the exact requested
-   commit are rejected.
+## Requirements
 
-The script interface (`sign-release-tag` / `verify-release-tag`) is the primary
-path; `tag-command.txt` is the transparent fallback.
-
-### Requirements and request validation
-
-The tag scripts require Git, GPG, Python 3.10 or newer, and `jsonschema` 4.23 or
-newer (below 5). Keep the scripts together with `scripts/release_signing.py` and
-`schemas/release-signing-request.schema.json`; the helper loads the local schema.
-For a signer or local tests, prepare a Python environment and activate it:
+Tag/approval tools require Git, GPG, Python 3.10+, and `jsonschema` (4.23+, below 5).
+Keep the tools together with their `release_*.py` modules and `schemas/` directory.
+A signer can use a virtual environment:
 
 ```sh
 python3 -m venv /path/to/signing-venv
 . /path/to/signing-venv/bin/activate
 python -m pip install -r scripts/requirements-signing.txt
-python -m unittest discover -s tests -p test_release_signing.py -v
 ```
 
-The integration tests generate disposable OpenPGP keys in temporary directories;
-they do not read or modify your personal keyring. They cover authorized signing
-subkeys, final/RC releases, malformed/duplicate JSON, inconsistent fields,
-unauthorized signatures, incorrect commits, unsigned and nested tags, reused tag
-objects, tampered signatures, and repository verification-program overrides.
+Jenkins explicitly uses Python 3.12. The early *Checkout Release Tools* stage
+installs missing DragonFly binary packages `python312`, `py312-jsonschema` and
+`gnupg`, validates the schema and checks for two authorized primary keys before
+any branch push. Workers need package installation permission when these are
+absent. Binary packages avoid building Python dependencies from source.
 
-Both tag scripts parse the request as JSON, reject duplicate fields and control
-characters, and enforce the committed Draft 2020-12 JSON schema. Requests are
-limited to 64 KiB of text. Additional checks require an even release minor and
-agreement between the target version, release branch, tag name, stage, RC number,
-and canonical tag message (`DragonFly x.y.z` or `DragonFly x.y.zrcN`). Final
-requests cannot contain `rc_number`. Validation happens before signing or tag
-verification. To check a request without accessing Git or signing keys:
+## First signer: review and sign the Git tag
+
+Use tools from an independently reviewed checkout of the pinned CI/CD commit.
+The source URL passed as `--origin` must be independently known, rather than
+blindly copied from an untrusted request. Run inside your DragonFly source checkout:
 
 ```sh
-scripts/validate-release-signing-request release-signing-request.json
+/path/to/trusted-cicd/scripts/sign-release-tag \
+  --key FIRST_PRIMARY_FINGERPRINT \
+  --origin https://your-gitea/your/DragonFlyBSD.git \
+  /path/to/release-signing-request.json
 ```
 
-Jenkins serializes requests using a JSON encoder and validates them before
-archiving. Its early *Checkout Release Tools* stage checks Python/GPG availability
-and explicitly uses Python 3.12, installing missing DragonFly binary packages
-(`python312`, `gnupg`, and `py312-jsonschema`). It invokes `python3.12` regardless
-of the system default. This avoids building
-Python dependencies from source on the worker and runs before branch pushes.
-The worker needs package installation permission when dependencies are absent.
+The script requires the full primary fingerprint and an authorized local secret
+key. It validates the JSON schema and consistency of version, branch, stage,
+RC number and label. It checks that the request's origin and local `origin`
+match the expected URL, fetches the release branch, and requires its tip to be
+the exact requested commit. It rejects tags already present locally or remotely.
+It displays the release identity, up to 50 commits and a diff summary since the
+highest earlier even-minor final release version on origin; odd-minor development
+tags such as `v6.5.0` are excluded. `--previous-tag vX.Y.Z` selects
+another final comparison tag. A comparison release need not be an ancestor:
+maintenance branches may contain cherry-picks absent from master.
 
-The signer's independent repository/source review and explicit key selection are
-still manual; request validation does not establish that the requested source is
-safe to release.
+Review the full source diff independently; a summary cannot establish source
+correctness. Terminal control characters in commit/filename output are escaped.
+If no earlier final tag exists, the script explicitly identifies this as an
+initial revision requiring independent review. It requires typing the exact
+release tag before signing, rechecks the remote branch/tag afterward, and signs
+with the selected local GPG key. Push the resulting tag yourself:
 
-### Authorized signers (the allowlist)
-
-`verify-release-tag` does not trust any key that happens to be in a keyring. It
-imports only the public keys committed under `keys/authorized-signers/*.asc`
-into a throwaway keyring, verifies the tag against that keyring, and then
-requires the signing key's primary fingerprint to be one of those keys. The
-directory **is** the allowlist; override its location with
-`AUTHORIZED_SIGNERS_DIR`.
-
-Only primary public-key fingerprints are allowlisted; signatures by their
-signing subkeys are mapped back to the primary fingerprint. Verification uses
-an isolated temporary GPG home and explicitly selects GPG/OpenPGP so repository
-configuration cannot substitute another verification program. Invalid, expired,
-or revoked signature/key status fails verification.
-
-The verifier resolves the requested tag ref once and checks that immutable tag
-object throughout. It requires an annotated tag, the signed object's internal
-`tag` header to match `release_tag`, and its direct object/type headers to name
-the requested commit. A signed RC tag copied under a final tag ref is therefore
-rejected, even if it targets the same commit. Nested tags are rejected. Git
-replacement objects are disabled for these checks.
-
-This fails closed: if the directory has no keys, verification rejects
-everything. See `keys/authorized-signers/README.md`. The final production
-key(s) are still to be decided (below), so no keys are committed yet.
-
-### Pausing the pipeline until the tag is signed (automated poll)
-
-The pipeline must not continue until the signed tag is on origin and validates.
-It does this by polling origin for the tag and verifying it when it appears,
-bounded by a timeout. Sketch of the stage (declarative pipeline):
-
-```groovy
-stage('Publish Signing Request') {
-    steps {
-        // ... after committing + pushing branches and the release commit ...
-        writeFile file: 'release-signing-request.json', text: requestJson
-        writeFile file: 'tag-command.txt', text: tagCommand
-        archiveArtifacts artifacts: 'release-signing-request.json,tag-command.txt'
-    }
-}
-
-stage('Await Signed Tag') {
-    when { expression { return !params.DRY_RUN } }
-    steps {
-        timeout(time: 3, unit: 'HOURS') {   // SIGNED_TAG_TIMEOUT_HOURS
-            waitUntil(initialRecurrencePeriod: 60000) {   // poll ~every 60s
-                script {
-                    // Tag present on origin yet?
-                    def present = sh(returnStatus: true, script: '''
-                        set -eu
-                        git ls-remote --exit-code --tags "$ORIGIN_URL" \
-                            "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
-                    ''') == 0
-                    if (!present) { return false }
-                    // Fetch it and verify; only a passing verify ends the wait.
-                    return sh(returnStatus: true, script: '''
-                        set -eu
-                        git -C src fetch --tags origin "refs/tags/$RELEASE_TAG"
-                        scripts/verify-release-tag release-signing-request.json
-                    ''') == 0
-                }
-            }
-        }
-    }
-}
+```sh
+git push origin refs/tags/v6.6.0rc1:refs/tags/v6.6.0rc1
 ```
 
-Notes:
-- This is implemented in `jenkins/Jenkinsfile.release-git` (stages *Commit And
-  Push Branches* → *Emit Signing Request* → *Await Signed Tag*). Because that job
-  keeps release tooling separate from its source checkout, it clones **this**
-  repo to `tools/` on the agent and runs `tools/scripts/verify-release-tag` with
-  `AUTHORIZED_SIGNERS_DIR=tools/keys/authorized-signers`.
-- The agent only needs the authorized **public** keys (from `keys/`), never a
-  private key — so the whole wait happens with no signing material on the worker.
-- A present tag that does not verify (bad signature, unauthorized signer, mismatched internal name, or
-  wrong commit) is treated as a **hard failure**, not a reason to keep waiting.
-  Only a not-yet-present tag keeps the loop polling; the surrounding `timeout`
-  bounds that wait.
-- Until an authorized public key is committed under `keys/authorized-signers`,
-  verification fails closed. To avoid pushing branches only to then block on a
-  tag that can never verify, the pipeline checks the allowlist is non-empty in
-  the early *Checkout Release Tools* stage (right after cloning origin, before
-  approval and any push) and fails fast if it is empty.
-- The wait is bounded by `SIGNED_TAG_TIMEOUT_HOURS` (default 3h).
+Jenkins emits `release-signing-request.json` and `tag-command.txt` as artifacts.
+The request records the tools commit for auditing. Jenkins first waits up to
+`SIGNED_TAG_TIMEOUT_HOURS` (default 3h) for the signed tag, verifies its first
+signature, and then waits for the second approval. A present invalid tag fails
+immediately; it is never accepted as a reason to continue.
+
+## Second signer: approve the exact signed release
+
+A different maintainer independently reviews the source and runs, inside their
+source checkout:
+
+```sh
+/path/to/trusted-cicd/scripts/approve-release \
+  --key SECOND_PRIMARY_FINGERPRINT \
+  --origin https://your-gitea/your/DragonFlyBSD.git \
+  --output-dir /path/to/cicd-worktree/approvals \
+  /path/to/release-signing-request.json
+```
+
+This repeats the repository/commit review, fetches the remote tag without
+replacing any local tag, and verifies the first signature using the trusted
+public-key allowlist. It refuses a second key with the same primary fingerprint.
+After explicit confirmation and a final remote-ref check, it creates:
+
+```text
+approvals/v6.6.0rc1/release.json
+approvals/v6.6.0rc1/second-signature.asc
+```
+
+The manifest contains a fixed `dragonfly-release-approval` context, repository
+URL, branch, tag, signed tag object ID and commit. The detached signature covers
+its exact bytes. It cannot approve a different repository, commit, tag object or
+release name. Existing approval directories are not overwritten. Review and commit
+both files in the CI/CD worktree, then publish them using the normal repository
+review process. No secret material belongs in this repository. Each tag directory identifies
+one source origin; use distinct test versions/RC numbers for rehearsals to avoid
+collisions with official release approval paths.
+
+Jenkins polls for the pair for up to `SECOND_APPROVAL_TIMEOUT_HOURS` (default 3h).
+A missing/partial pair waits; fetch errors or invalid evidence fail the build.
+Files must be regular, non-executable Git blobs, each at most 64 KiB. Symlinks are
+never followed. One approval commit is resolved and recorded for the pair.
+
+Before success, Jenkins fetches the current source tag again so a replacement
+during the approval wait cannot be hidden by a stale local ref. The pinned
+verifier rechecks both signatures against the pinned
+keys, requires distinct primary fingerprints, and compares the manifest with
+the requested source and exact signed tag object. Jenkins archives the manifest,
+detached signature, approval source commit and a JSON verification report with
+both primary fingerprints. `git verify-tag` alone verifies only the first
+signature; the full policy is checked by:
+
+```sh
+scripts/verify-release-approval release-signing-request.json /path/to/approval-pair
+```
+
+## Validation and security boundaries
+
+Both JSON schemas reject unknown/missing fields and invalid types. Parsing also
+rejects duplicate fields, control characters, nonstandard JSON constants, and
+inputs over 64 KiB. Request fields must agree on an even release minor and the
+canonical label. Final requests cannot contain `rc_number`.
+
+Tag verification requires a valid authorized OpenPGP signature, the signed
+internal tag name, and a direct reference to the exact requested commit. It
+resolves the tag once and uses that immutable object ID throughout. Nested or
+unsigned tags and signed tags copied under another name are rejected. It uses
+an isolated public-key keyring, disables Git replacement objects, and ignores
+repository overrides of the GPG verification program. Expired/revoked signature
+or key status fails verification. Subkeys map to their primary fingerprint.
+
+The trust boundary is the reviewed pipeline/tools revision, public-key
+registration, independent human review and private-key custody. A signature
+proves what a key signed, not that the source is correct. The source branches
+are already published before external signing; failed signing does not roll back
+those pushes. Re-run on the release branch with `VERSION_BUMP=none` and the same
+explicit target/stage/RC to resume without branch edits. Existing evidence is
+accepted only if it still matches the source/tag and current pinned key policy.
+
+Run the real Git/GPG checks with disposable keys (personal keyrings are untouched):
+
+```sh
+python -m unittest discover -s tests -p 'test_release_*.py' -v
+groovy tests/release-version.groovy
+RELEASE_SIGNING_TEST_PYTHON=/absolute/path/to/signing-venv/bin/python \
+  groovy tests/release-workflow.groovy
+```
+
+The Groovy integration checks execute the actual Git/signing stages, including
+pinned-tool checkout, the complete two-person flow and a moving approval commit
+that maliciously changes scripts/keys. Jenkins CPS and UI approval integration
+still require a real rehearsal.
 
 ## Signing release artifacts
 
@@ -223,8 +224,6 @@ the open question below.
   allowlist mechanism is in place (`keys/authorized-signers/*.asc`), but no keys
   are committed, so verification fails closed until they are chosen and added.
 - The signer pushes the signed tag to origin; the pipeline polls for it.
-- Verification tooling and keys still come from the configured tools branch.
-  Pinning that trust configuration to a reviewed revision is a separate follow-up.
 - The poll timeout (`SIGNED_TAG_TIMEOUT_HOURS`, default 3h) and poll interval are
   tunable.
 - Artifact/image signing is wired as skeletons; it activates once the build

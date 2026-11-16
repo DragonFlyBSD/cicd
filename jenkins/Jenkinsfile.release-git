@@ -204,15 +204,24 @@ pipeline {
         // keys/authorized-signers allowlist are cloned onto the agent because
         // source checkout and release verification tooling are kept separate.
         RELEASE_TOOLS_URL = 'https://github.com/DragonFlyBSD/cicd.git'
-        RELEASE_TOOLS_REF = 'master'
+        // RELEASE_TOOLS_COMMIT must be a reviewed full commit ID configured
+        // in the job. It pins scripts, schemas and the authorized public keys.
+        RELEASE_APPROVALS_REF = 'master'
         // How long to wait for the externally-signed tag to appear on origin.
         SIGNED_TAG_TIMEOUT_HOURS = '3'
+        SECOND_APPROVAL_TIMEOUT_HOURS = '3'
     }
 
     stages {
         stage('Validate Parameters') {
             steps {
                 script {
+                    if (!params.DRY_RUN && params.containsKey('RELEASE_TOOLS_COMMIT')) {
+                        error('RELEASE_TOOLS_COMMIT is a protected trust setting; configure it outside Build with Parameters.')
+                    }
+                    if (!params.DRY_RUN && !(env.RELEASE_TOOLS_COMMIT ==~ /^[0-9a-f]{40}$/)) {
+                        error('RELEASE_TOOLS_COMMIT must be a reviewed full commit ID configured in the job for real runs.')
+                    }
                     if (!params.ORIGIN_URL?.trim()) {
                         error('ORIGIN_URL is required')
                     }
@@ -302,7 +311,15 @@ EOF
                     set -eu
                     export GIT_TERMINAL_PROMPT=0
                     rm -rf tools
-                    git clone --depth 1 --branch "$RELEASE_TOOLS_REF" -- "$RELEASE_TOOLS_URL" tools
+                    git init tools
+                    git -C tools remote add origin "$RELEASE_TOOLS_URL"
+                    git -C tools fetch --depth 1 origin "$RELEASE_TOOLS_COMMIT"
+                    git -C tools checkout --detach FETCH_HEAD
+                    test "$(git -C tools rev-parse HEAD)" = "$RELEASE_TOOLS_COMMIT"
+                    # This separate bare repo supplies approval DATA only. Its
+                    # moving branch never supplies executable scripts or keys.
+                    git init --bare approval-data.git
+                    git --git-dir=approval-data.git remote add origin "$RELEASE_TOOLS_URL"
                     chmod +x tools/scripts/verify-release-tag tools/scripts/sign-release-tag
                     test -d tools/keys/authorized-signers
 
@@ -329,6 +346,8 @@ EOF
                     fi
                     python3.12 -c 'import json; from jsonschema import Draft202012Validator; Draft202012Validator.check_schema(json.load(open("tools/schemas/release-signing-request.schema.json")))'
                     command -v gpg >/dev/null
+                    AUTHORIZED_SIGNERS_DIR="$WORKSPACE/tools/keys/authorized-signers" \
+                        python3.12 tools/scripts/check-release-signing-policy
 
                     echo "Authorized signer keys present:"
                     for k in tools/keys/authorized-signers/*.asc; do echo "  $k"; done
@@ -391,7 +410,8 @@ Release tag: ${env.RELEASE_TAG}
 Next development version: ${env.NEXT_DEV_VERSION}
 Dry run: ${params.DRY_RUN}
 Approver required: ${env.RELEASE_APPROVERS}
-Signing: external (tag signed off-Jenkins, then verified)
+Signing: external tag plus second approval from a different authorized primary key
+Verification tools commit: ${env.RELEASE_TOOLS_COMMIT ?: "not used (dry run)"}
 """.stripIndent())
                 }
             }
@@ -541,7 +561,8 @@ Dry run: ${params.DRY_RUN}
 
 This approval covers generated diffs, commits, and branch pushes, and emitting
 the signing request. The tag is signed OUTSIDE Jenkins by an authorized signer
-and verified before the build completes.
+and requires a second detached approval from a different authorized primary key
+before the build completes.
 Review archived release-plan.txt, release-branch.patch, and master.patch before approving.
 """.stripIndent()
 
@@ -637,6 +658,7 @@ EOF
                 script {
                     def request = [
                         schema_version: '1',
+                        tools_commit: env.RELEASE_TOOLS_COMMIT,
                         release_tag: env.RELEASE_TAG,
                         release_branch: env.RELEASE_BRANCH,
                         target_version: env.TARGET_VERSION_COMPUTED,
@@ -665,13 +687,15 @@ EOF
 # Commit: $RELEASE_COMMIT  (tip of $RELEASE_BRANCH on origin)
 #
 # Primary path (recommended): run the signing script, then push:
-#   scripts/sign-release-tag release-signing-request.json
+#   scripts/sign-release-tag --key FIRST_PRIMARY_FINGERPRINT --origin EXPECTED_SOURCE_ORIGIN release-signing-request.json
 #   git push origin $RELEASE_TAG
 #
-# Transparent fallback (equivalent):
-#   git fetch origin $RELEASE_BRANCH
-#   git tag -s -m "$RELEASE_LABEL" $RELEASE_TAG $RELEASE_COMMIT
-#   git push origin $RELEASE_TAG
+# A second authorized person then reviews the pushed tag and runs:
+#   scripts/approve-release --key SECOND_PRIMARY_FINGERPRINT --origin EXPECTED_SOURCE_ORIGIN \
+#       --output-dir /path/to/cicd/approvals release-signing-request.json
+# Commit both generated approval files in the CI/CD repository.
+# Both signers must independently review the source before confirming.
+
 EOF
                 '''
                 archiveArtifacts artifacts: 'release-signing-request.json,tag-command.txt', allowEmptyArchive: false
@@ -753,6 +777,65 @@ EOF
             }
         }
 
+        stage('Await Second Approval') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.GIT_CREDENTIALS_ID,
+                    usernameVariable: 'GITEA_USER',
+                    passwordVariable: 'GITEA_TOKEN'
+                )]) {
+                    script {
+                        timeout(time: env.SECOND_APPROVAL_TIMEOUT_HOURS.toInteger(), unit: 'HOURS') {
+                            waitUntil(initialRecurrencePeriod: 60000) {
+                                def rc = sh(returnStatus: true, script: '''
+                                set -eu
+                                export GIT_TERMINAL_PROMPT=0
+                                "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/fetch-release-approval" \
+                                    --git-dir "$WORKSPACE/approval-data.git" --ref "$RELEASE_APPROVALS_REF" \
+                                    --tag "$RELEASE_TAG" --output "$WORKSPACE/release-approval"
+                            ''')
+                                if (rc == 2) {
+                                    echo "Waiting for approvals/${env.RELEASE_TAG}/release.json and second-signature.asc in the CI/CD repository."
+                                    return false
+                                }
+                                if (rc != 0) {
+                                    error('Fetching approval data failed; refusing to treat a fetch error as a missing approval.')
+                                }
+                                sh '''
+                                set -eu
+                                cat > git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' "$GITEA_USER" ;;
+*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
+*) printf '\n' ;;
+esac
+EOF
+                                chmod 700 git-askpass.sh
+                                export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                                export GIT_TERMINAL_PROMPT=0
+                                cd "$WORKSPACE/src"
+                                # The tag may have moved during the approval wait.
+                                # Verify the current remote object against the evidence.
+                                git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+                                AUTHORIZED_SIGNERS_DIR="$WORKSPACE/tools/keys/authorized-signers" \
+                                    "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/verify-release-approval" \
+                                    --report "$WORKSPACE/release-approval/verification.json" \
+                                    "$WORKSPACE/release-signing-request.json" "$WORKSPACE/release-approval"
+                            '''
+                                archiveArtifacts artifacts: 'release-approval/*', allowEmptyArchive: false
+                                return true
+                            }
+                        }
+                        sh 'rm -f "$WORKSPACE/git-askpass.sh"'
+                    }
+                }
+            }
+        }
+
         stage('Dry Run Summary') {
             when {
                 expression { return params.DRY_RUN }
@@ -763,7 +846,7 @@ EOF
                     printf 'DRY_RUN=true: no commits, branch pushes, or signing request were performed.\n'
                     printf 'On a real run, after pushing branches the pipeline would emit a signing\n'
                     printf 'request for tag %s (label "%s") and wait for an authorized signer to push\n' "$RELEASE_TAG" "$RELEASE_LABEL"
-                    printf 'the signed tag, then verify it against keys/authorized-signers.\n'
+                    printf 'the signed tag, verify it, and require a second approval from a different primary key.\n'
                 '''
             }
         }

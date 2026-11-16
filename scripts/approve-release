@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Review a signed tag and publish a second signature as public approval data."""
+
+import argparse
+import json
+from pathlib import Path
+import sys
+import tempfile
+
+from release_signing import SigningError, command, git, load_request
+from release_approval import approval_manifest
+from release_review import TRANSPORT, confirm, display, remote_refs, review_source, signing_key
+from release_verification import authorized_keyring, verify_detached, verify_tag
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--key', required=True, help='full primary approval-key fingerprint')
+    parser.add_argument('--origin', required=True, help='independently known source origin URL')
+    parser.add_argument('--previous-tag', help='override the comparison final release tag')
+    parser.add_argument('--output-dir', required=True, help='approvals/ directory in your CI/CD checkout')
+    parser.add_argument('request')
+    args = parser.parse_args()
+    request = load_request(args.request)
+    key = signing_key(args.key)
+    refs = review_source(request, args.origin, args.previous_tag)
+    tag_ref = f"refs/tags/{request['release_tag']}"
+    if tag_ref not in refs:
+        raise SigningError('signed release tag is not on origin yet')
+    # Fetch to FETCH_HEAD; never overwrite a locally existing release tag.
+    git(*TRANSPORT, 'fetch', '--no-tags', 'origin', tag_ref)
+    oid = git('rev-parse', 'FETCH_HEAD').decode().strip()
+    if oid != refs[tag_ref]:
+        raise SigningError('release tag changed while fetching; restart review')
+    # Verify the fetched immutable object rather than a possibly stale local ref.
+    with authorized_keyring(minimum=2) as keyring:
+        oid, first = verify_tag(request, keyring=keyring, oid=oid)
+        if key not in keyring[1]:
+            raise SigningError('approval key is not an authorized primary key')
+        if key == first:
+            raise SigningError('second approval must use a different authorized primary key')
+        display(f'Tag object: {oid}\nTag signer: {first}\nApproval key: {key}')
+        confirm(request, 'approve')
+        if remote_refs(request, args.origin).get(tag_ref) != oid:
+            raise SigningError('release tag changed during review; no approval was created')
+        payload = (json.dumps(approval_manifest(request, oid), indent=2) + '\n').encode()
+        destination = Path(args.output_dir) / request['release_tag']
+        # Never silently replace previous approval evidence.
+        if destination.exists():
+            raise SigningError(f'approval directory already exists: {destination}')
+        with tempfile.TemporaryDirectory(prefix='release-approve-') as temporary:
+            data = Path(temporary) / 'release.json'
+            sig = Path(temporary) / 'second-signature.asc'
+            data.write_bytes(payload)
+            command(['gpg', '--armor', '--detach-sign', '--local-user', key,
+                     '--output', str(sig), str(data)])
+            if verify_detached(payload, sig.read_bytes(), keyring) != key:
+                raise SigningError('approval signature does not match the selected primary key')
+            destination.mkdir(parents=True, exist_ok=False)
+            (destination / 'release.json').write_bytes(payload)
+            (destination / 'second-signature.asc').write_bytes(sig.read_bytes())
+    print(f'Approval written to {destination}; review and commit both files to the CI/CD repository.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (SigningError, OSError, UnicodeError) as exc:
+        sys.exit(f'approve-release: {exc}')

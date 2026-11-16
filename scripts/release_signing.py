@@ -32,16 +32,17 @@ def reject_constant(value):
     raise SigningError(f"invalid JSON constant: {value}")
 
 
-def load_request(path):
+def load_document(path, schema_name, *, content=None):
     try:
-        with open(path, "rb") as stream:
-            content = stream.read(65537)
+        if content is None:
+            with open(path, "rb") as stream:
+                content = stream.read(65537)
         if len(content) > 65536:
             raise SigningError("signing request exceeds 64 KiB")
         request = json.loads(
             content.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=reject_constant
         )
-        schema_path = Path(__file__).resolve().parent.parent / "schemas/release-signing-request.schema.json"
+        schema_path = Path(__file__).resolve().parent.parent / "schemas" / schema_name
         with schema_path.open(encoding="utf-8") as stream:
             schema = json.load(stream)
         Draft202012Validator.check_schema(schema)
@@ -58,6 +59,11 @@ def load_request(path):
         if isinstance(value, str) and re.search(r"[\x00-\x1f\x7f]", value):
             raise SigningError(f"control character in request field: {key}")
 
+    return request
+
+
+def load_request(path):
+    request = load_document(path, "release-signing-request.schema.json")
     major, minor, patch = (int(part) for part in request["target_version"].split("."))
     version = f"{major}.{minor}.{patch}"
     if minor % 2:

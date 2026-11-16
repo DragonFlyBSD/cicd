@@ -1,14 +1,17 @@
 // Run from the repository root: groovy tests/release-workflow.groovy
 // Execute the actual pipeline's Git stages against disposable local repositories.
-// This harness supplies Pipeline steps; it does not emulate Jenkins CPS or GPG.
+// This harness supplies Pipeline steps and uses real Git/GPG; it does not emulate Jenkins CPS.
 def pipelineFile = new File('jenkins/Jenkinsfile.release-git').canonicalFile
 def root = File.createTempDir('release-workflow-', '')
 def gitEnvironment = [GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null']
-def run = { File directory, List<String> command, Map extra = [:] ->
+def run = { File directory, List<String> command, Map extra = [:], String input = null ->
     def builder = new ProcessBuilder(command).directory(directory)
     builder.environment().putAll(gitEnvironment)
     extra.each { key, value -> builder.environment()[key.toString()] = value.toString() }
     def process = builder.start()
+    if (input != null) {
+        process.outputStream.withWriter('UTF-8') { writer -> writer.write(input) }
+    }
     def output = new StringBuffer()
     def errors = new StringBuffer()
     process.waitForProcessOutput(output, errors)
@@ -61,14 +64,15 @@ def createFixture = { String name ->
     [directory:directory, origin:origin, seed:seed]
 }
 def counter = 0
-def newBuild = { Map fixture, Map overrides = [:] ->
+def newBuild = { Map fixture, Map overrides = [:], Map environmentOverrides = [:] ->
     def workspace = new File(fixture.directory, "build-${++counter}")
     workspace.mkdirs()
     def params = [ORIGIN_URL:fixture.origin.toURI().toString().replaceFirst('^file:/', 'file:///'), BASE_BRANCH:'master',
                   VERSION_BUMP:'minor', TARGET_VERSION:'', RELEASE_STAGE:'rc', RC_NUMBER:'1', DRY_RUN:false] + overrides
     def env = [WORKSPACE:workspace.path, GIT_AUTHOR_NAME:'Release Test', GIT_AUTHOR_EMAIL:'release@example.invalid',
                ALLOWED_ORIGIN_PREFIX:fixture.origin.toURI().toString().replaceFirst('^file:/', 'file:///'), GIT_CREDENTIALS_ID:'unused',
-               RELEASE_APPROVERS:'tester', BUILD_TAG:'local-test', SIGNING_PYTHON:signingPython]
+               RELEASE_TOOLS_COMMIT:('a' * 40), RELEASE_APPROVERS:'tester', BUILD_TAG:'local-test', SIGNING_PYTHON:signingPython]
+    env.putAll(environmentOverrides)
     params.each { key, value -> env[key] = value.toString() }
     def binding = new Binding([params:params, env:env])
     def script = new GroovyShell(binding).parse(pipelineFile)
@@ -91,7 +95,13 @@ def newBuild = { Map fixture, Map overrides = [:] ->
     script.metaClass.deleteDir = { assert workspace.list().length == 0 }
     script.metaClass.readFile = { String path -> new File(workspace, path).text }
     script.metaClass.writeFile = { Map arguments -> put(workspace, arguments.file, arguments.text.toString()) }
-    script.metaClass.archiveArtifacts = { Map ignored -> }
+    def archives = []
+    script.metaClass.archiveArtifacts = { Map arguments -> archives << arguments.artifacts }
+    script.metaClass.echo = { String ignored -> }
+    script.metaClass.timeout = { Map ignored, Closure body -> body.call() }
+    script.metaClass.waitUntil = { Map ignored, Closure body ->
+        if (!body.call()) { throw new IllegalStateException('Local harness: still waiting') }
+    }
     script.metaClass.error = { String message -> throw new IllegalArgumentException(message) }
     script.metaClass.sh = { Object arguments ->
         String command = arguments instanceof Map ? arguments.script : arguments.toString()
@@ -105,7 +115,7 @@ def newBuild = { Map fixture, Map overrides = [:] ->
         return arguments instanceof Map && arguments.returnStdout ? result.output : null
     }
     script.run()
-    [workspace:workspace, env:env, params:params, stage:{ String name ->
+    [workspace:workspace, env:env, params:params, archives:archives, stage:{ String name ->
         stages[name].call()
         if (name == 'Clone Origin') {
             // Checkout Release Tools normally supplies these files on Jenkins.
@@ -252,7 +262,107 @@ try {
     git(basic.origin, ['update-ref', 'refs/heads/DragonFly_RELEASE_6_4', released])
     rejects('changed during approval') { changedRelease.stage('Commit And Push Branches') }
 
-    println 'Release workflow integration checks passed'
+    // Full two-person release: pinned executable tools and keys, moving approval DATA.
+    def gpgHome = new File(run(root, [signingPython, '-c',
+        "import tempfile; print(tempfile.mkdtemp(prefix='dfwf-', dir='/tmp'))"]).output.trim())
+    try {
+        def keyEnv = [GNUPGHOME:gpgHome.path]
+        def gpg = { List<String> args ->
+            def result = run(root, ['gpg', '--no-options', '--batch', '--pinentry-mode',
+                'loopback', '--passphrase', ''] + args, keyEnv)
+            assert result.status == 0 : result.errors
+            result.output
+        }
+        gpg(['--quick-generate-key', 'First Test <first@example.invalid>', 'ed25519', 'sign', '0'])
+        gpg(['--quick-generate-key', 'Second Test <second@example.invalid>', 'ed25519', 'sign', '0'])
+        def fingerprints = gpg(['--with-colons', '--list-keys']).readLines()
+            .findAll { it.startsWith('fpr:') }.collect { it.split(':')[9] }
+        assert fingerprints.size() == 2
+        def toolsSeed = new File(root, 'trusted-tools')
+        toolsSeed.mkdirs()
+        git(toolsSeed, ['init', '-b', 'master'])
+        git(toolsSeed, ['config', 'user.name', 'Trusted Tools'])
+        git(toolsSeed, ['config', 'user.email', 'tools@example.invalid'])
+        ['scripts', 'schemas'].each { dir ->
+            new File(pipelineFile.parentFile.parentFile, dir).eachFile { file ->
+                if (file.isFile()) { put(toolsSeed, "${dir}/${file.name}", file.text) }
+            }
+        }
+        fingerprints.eachWithIndex { fingerprint, index ->
+            put(toolsSeed, "keys/authorized-signers/key-${index}.asc", gpg(['--armor', '--export', fingerprint]))
+        }
+        git(toolsSeed, ['add', '.'])
+        git(toolsSeed, ['commit', '-m', 'Reviewed tools and two authorized keys'])
+        def pin = git(toolsSeed, ['rev-parse', 'HEAD'])
+        def signedFixture = createFixture('signed-release')
+        def signedBuild = newBuild(signedFixture, [:], [
+            RELEASE_TOOLS_URL:toolsSeed.toURI().toString().replaceFirst('^file:/', 'file:///'),
+            RELEASE_TOOLS_COMMIT:pin, RELEASE_APPROVALS_REF:'master',
+            SIGNED_TAG_TIMEOUT_HOURS:'1', SECOND_APPROVAL_TIMEOUT_HOURS:'1',
+            PATH:new File(signingPython).parent + ':' + System.getenv('PATH')])
+        ['Validate Parameters', 'Clone Origin', 'Checkout Release Tools', 'Compute Release Plan',
+         'Check Remote Refs', 'Prepare Release Changes', 'Commit And Push Branches',
+         'Emit Signing Request'].each { signedBuild.stage(it) }
+        def trusted = new File(signedBuild.workspace, 'tools')
+        assert git(trusted, ['rev-parse', 'HEAD']) == pin
+        def request = new File(signedBuild.workspace, 'release-signing-request.json')
+        def releaseTree = new File(signedBuild.workspace, 'release-src')
+        def sourceOrigin = signedFixture.origin.toURI().toString().replaceFirst('^file:/', 'file:///')
+        def signedResult = run(releaseTree, [signingPython, new File(trusted, 'scripts/sign-release-tag').path,
+            '--key', fingerprints[0], '--origin', sourceOrigin, request.path], keyEnv, 'v6.6.0rc1\n')
+        assert signedResult.status == 0 : signedResult.errors
+        git(releaseTree, ['push', 'origin', 'refs/tags/v6.6.0rc1'])
+        signedBuild.stage('Await Signed Tag')
+        rejects('still waiting') { signedBuild.stage('Await Second Approval') }
+        def approvalResult = run(releaseTree, [signingPython, new File(trusted, 'scripts/approve-release').path,
+            '--key', fingerprints[1], '--origin', sourceOrigin,
+            '--output-dir', new File(toolsSeed, 'approvals').path, request.path], keyEnv, 'v6.6.0rc1\n')
+        assert approvalResult.status == 0 : approvalResult.errors
+        // A newer approval commit also changes scripts and keys. Those changes
+        // must never influence the pinned verification executed by Jenkins.
+        def marker = new File(root, 'untrusted-verifier-executed')
+        put(toolsSeed, 'scripts/verify-release-approval', "#!/bin/sh\ntouch '${marker.path}'\nexit 0\n")
+        assert new File(toolsSeed, 'keys/authorized-signers/key-1.asc').delete()
+        git(toolsSeed, ['add', '.'])
+        git(toolsSeed, ['commit', '-m', 'Publish approval alongside untrusted tool changes'])
+        signedBuild.stage('Await Second Approval')
+        assert !marker.exists()
+        def report = new File(signedBuild.workspace, 'release-approval/verification.json').text
+        assert report.contains(fingerprints[0]) && report.contains(fingerprints[1])
+        assert new File(signedBuild.workspace, 'release-approval/source-commit.txt').text.trim() ==
+            git(toolsSeed, ['rev-parse', 'HEAD'])
+        assert signedBuild.archives.contains('release-approval/*')
+        assert git(trusted, ['rev-parse', 'HEAD']) == pin
+        // Even an authentic second signature by the FIRST signer is insufficient.
+        def approvalDir = new File(toolsSeed, 'approvals/v6.6.0rc1')
+        gpg(['--yes', '--armor', '--detach-sign', '--local-user', fingerprints[0],
+             '--output', new File(approvalDir, 'second-signature.asc').path,
+             new File(approvalDir, 'release.json').path])
+        git(toolsSeed, ['add', '.'])
+        git(toolsSeed, ['commit', '-m', 'Publish insufficient same-person approval'])
+        rejects('different authorized primary key') { signedBuild.stage('Await Second Approval') }
+        // A tag replacement during the second-approval wait must not be hidden
+        // by src's old fetched ref, even if the replacement is signed by key A.
+        gpg(['--yes', '--armor', '--detach-sign', '--local-user', fingerprints[1],
+             '--output', new File(approvalDir, 'second-signature.asc').path,
+             new File(approvalDir, 'release.json').path])
+        git(toolsSeed, ['add', '.'])
+        git(toolsSeed, ['commit', '-m', 'Restore independent approval'])
+        def replacement = run(releaseTree, ['git', '-c', 'gpg.format=openpgp', 'tag', '-s', '-f',
+            '-u', fingerprints[0], '-m', 'DragonFly 6.6.0rc1', 'v6.6.0rc1'],
+            keyEnv + [GIT_COMMITTER_DATE:'2001-01-01T00:00:00Z'])
+        assert replacement.status == 0 : replacement.errors
+        git(releaseTree, ['push', '--force', 'origin', 'refs/tags/v6.6.0rc1'])
+        rejects('manifest does not match') { signedBuild.stage('Await Second Approval') }
+        def badPin = newBuild(createFixture('bad-pin'), [:], [RELEASE_TOOLS_COMMIT:'master'])
+        rejects('reviewed full commit ID') { badPin.stage('Validate Parameters') }
+        def editablePin = newBuild(createFixture('editable-pin'), [RELEASE_TOOLS_COMMIT:pin])
+        rejects('protected trust setting') { editablePin.stage('Validate Parameters') }
+    } finally {
+        run(root, ['gpgconf', '--homedir', gpgHome.path, '--kill', 'all'])
+        assert gpgHome.deleteDir()
+    }
+    println 'Release workflow and two-person signing integration checks passed'
 } finally {
     assert root.deleteDir()
 }

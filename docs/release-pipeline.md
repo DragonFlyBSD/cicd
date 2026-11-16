@@ -78,7 +78,7 @@ Additional fixed defaults for the first Jenkinsfile:
 ```text
 Jenkins agent label: dragonflybsd-nvmm large
 Jenkins credential ID: release-rehersal
-Signing: external; Jenkins holds no signing private key
+Signing: external tag plus second approval from a different authorized primary key
 Git commit author: job parameters or environment (GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL)
 Allowed approver: tuxillo
 Required approvals: 1 Jenkins user
@@ -115,6 +115,12 @@ Jenkinsfile's `parameters {}` block. Do not replace the parameter property using
 `properties([parameters(...)])`, since that can remove the manually configured
 parameters. If migrating from an older pipeline that defined those names, check
 that they remain present after the first run and restore them in the UI if needed.
+
+Before non-dry-runs, an administrator must set `RELEASE_TOOLS_COMMIT` to the
+reviewed full CI/CD commit containing the tools and at least two authorized
+primary public keys. This trust pin must be protected environment configuration,
+not a build parameter; the pipeline rejects editable parameters with that name.
+See `docs/signing.md` for the two-person signing and public approval process.
 
 Configure `BASE_BRANCH` in Jenkins UI as an Active Choices Parameter.
 
@@ -270,7 +276,9 @@ The pipeline clones only from `origin`.
 6. For a new series, commit both branches and push them atomically with leases.
    For an existing series, recheck the release branch tip; push no branches.
 7. Emit the external signing request for the exact reviewed release commit.
-8. Wait for and verify the signed tag against that commit and authorized keys.
+8. Wait for and verify the signed tag against that commit and pinned authorized keys.
+9. Fetch public approval data from this CI/CD repository, using pinned code only.
+10. Verify a detached approval from a different authorized primary key; archive evidence.
 ```
 
 ## Branch Rules
@@ -304,8 +312,8 @@ waiting for external signing), do not rerun major/minor creation. Instead:
    or branch pushes.
 
 With `VERSION_BUMP=none`, an already-present tag is allowed through planning so
-it can be verified by the normal authorized-signature/exact-commit checks. It
-is never replaced. A wrong or unsigned existing tag still fails verification.
+it can be verified by the normal authorized-signature/exact-commit checks and
+second-approval policy. It is never replaced. A wrong or unsigned existing tag still fails verification.
 Other operations reject an existing target tag. If a release branch moves while
 approval is pending, the run fails and must be restarted to review the new tip.
 

@@ -64,6 +64,11 @@
     "jenkins_build": {
       "description": "Jenkins build identifier that produced this request.",
       "type": "string"
+    },
+    "tools_commit": {
+      "description": "Reviewed CI/CD tooling and key allowlist revision used by Jenkins.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
     }
   },
   "allOf": [

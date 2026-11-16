@@ -1,99 +1,15 @@
 #!/usr/bin/env python3
-"""Verify an authorized OpenPGP tag's signed identity and direct commit target."""
-
-import os
-from pathlib import Path
-import subprocess
+"""Verify the release tag's first signature and signed identity."""
 import sys
-import tempfile
+from release_signing import SigningError, load_request
+from release_verification import verify_tag
 
-from release_signing import SigningError, command, git, load_request, require_commit
-
-
-def primary_fingerprints(listing):
-    fingerprints = set()
-    primary = False
-    for line in listing.decode("ascii").splitlines():
-        fields = line.split(":")
-        if fields[0] in ("pub", "sub"):
-            primary = fields[0] == "pub"
-        elif fields[0] == "fpr" and primary:
-            fingerprints.add(fields[9])
-            primary = False
-    return fingerprints
-
-
-def main():
-    if len(sys.argv) != 2:
-        raise SigningError("usage: verify-release-tag release-signing-request.json")
-    request = load_request(sys.argv[1])
-    tag = request["release_tag"]
-    commit = request["commit"]
-    git("rev-parse", "--git-dir")
-    require_commit(commit)
-    # Resolve once and use this immutable object ID for every subsequent check.
-    oid = git("rev-parse", "--verify", f"refs/tags/{tag}").decode("ascii").strip()
-    if git("cat-file", "-t", oid).strip() != b"tag":
-        raise SigningError("release tag must be an annotated, signed tag")
-    headers, separator, _ = git("cat-file", "tag", oid).partition(b"\n\n")
-    if not separator:
-        raise SigningError("malformed tag object")
-    values = {}
-    for line in headers.split(b"\n"):
-        name, space, value = line.partition(b" ")
-        if not space or name in values:
-            raise SigningError("malformed or duplicate tag header")
-        values[name] = value
-    if values.get(b"tag") != tag.encode("ascii"):
-        raise SigningError("signed internal tag name does not match requested release_tag")
-    if values.get(b"type") != b"commit" or values.get(b"object") != commit.encode("ascii"):
-        raise SigningError("signed tag must point directly at the exact requested commit")
-
-    keys_dir = Path(os.environ.get(
-        "AUTHORIZED_SIGNERS_DIR", Path(__file__).resolve().parent.parent / "keys/authorized-signers"
-    ))
-    keys = sorted(keys_dir.glob("*.asc"))
-    if not keys:
-        raise SigningError(f"no authorized signer public keys in {keys_dir}")
-
-    with tempfile.TemporaryDirectory(prefix="release-verify-") as home:
-        os.chmod(home, 0o700)
-        env = dict(os.environ, GNUPGHOME=home)
-        for key in keys:
-            command(["gpg", "--homedir", home, "--no-options", "--no-autostart", "--batch", "--quiet",
-                     "--import", str(key.resolve())], env=env)
-        listing = command(["gpg", "--homedir", home, "--no-options", "--no-autostart", "--batch", "--with-colons",
-                           "--list-keys"], env=env)
-        allowed = primary_fingerprints(listing)
-        if not allowed:
-            raise SigningError("authorized public keyring is empty")
-        # Pin the OpenPGP executable; repository gpg settings cannot substitute
-        # another signature format/program for this allowlist verification.
-        result = subprocess.run(
-            ["git", "-c", "gpg.format=openpgp", "-c", "gpg.program=gpg",
-             "-c", "gpg.openpgp.program=gpg", "verify-tag", "--raw", oid],
-            capture_output=True, env=dict(env, GIT_NO_REPLACE_OBJECTS="1")
-        )
-        status = result.stderr.decode("utf-8", errors="replace")
-        if result.returncode:
-            raise SigningError("tag signature did not verify against authorized public keys")
-        valid = []
-        for line in status.splitlines():
-            fields = line.split()
-            if fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
-                # Last (optional) field is the primary fingerprint for a subkey.
-                valid.append(fields[11] if len(fields) == 12 else fields[2])
-            if len(fields) > 1 and fields[0] == "[GNUPG:]" and fields[1] in {
-                "BADSIG", "ERRSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG", "KEYEXPIRED", "SIGEXPIRED"
-            }:
-                raise SigningError("tag has an invalid, expired or revoked signature/key")
-        if len(valid) != 1 or valid[0] not in allowed:
-            raise SigningError("tag must have one valid signature from an authorized primary key")
-        print(f"OK: {tag} verified (signer {valid[0]}) against {commit}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
-        main()
+        if len(sys.argv) != 2:
+            raise SigningError('usage: verify-release-tag release-signing-request.json')
+        request = load_request(sys.argv[1])
+        oid, signer = verify_tag(request)
+        print(f"OK: {request['release_tag']} verified (signer {signer}) against {request['commit']} (tag object {oid})")
     except (SigningError, OSError, UnicodeError) as exc:
-        sys.exit(f"verify-release-tag: {exc}")
+        sys.exit(f'verify-release-tag: {exc}')

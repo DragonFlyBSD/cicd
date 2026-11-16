@@ -9,6 +9,14 @@ version-controlled.
 `*.asc` in this directory into a throwaway keyring and require the signature to
 come from one of these keys. The directory is the allowlist.
 
+The release pipeline requires at least two distinct, non-revoked/non-expired
+primary public keys before pushing branches. One signs the tag; a different
+primary key signs the public approval manifest. Multiple files or subkeys of one
+primary key count once. Assign keys to different maintainers and independently
+verify fingerprints. Jenkins uses this directory from `RELEASE_TOOLS_COMMIT`,
+not from the moving approval branch. A key change takes effect only after the
+reviewed trust pin is deliberately updated.
+
 **Fail-closed:** if this directory contains no `*.asc` files, verification
 fails. Until the final authorized production key(s) are decided, no keys are
 committed and verification will reject everything. Do not add a key here as a

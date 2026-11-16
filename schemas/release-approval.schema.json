@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DragonFly second release approval",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "origin_url", "release_branch", "release_tag", "tag_object", "commit"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "kind": {"const": "dragonfly-release-approval"},
+    "origin_url": {"type": "string", "minLength": 1},
+    "release_branch": {"type": "string", "pattern": "^DragonFly_RELEASE_[0-9]+_[0-9]+$"},
+    "release_tag": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(rc[1-9][0-9]*)?$"},
+    "tag_object": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+  }
+}

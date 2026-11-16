@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Fail before publishing if fewer than two authorized primary keys are configured."""
+import sys
+from release_signing import SigningError
+from release_verification import authorized_keyring
+
+if __name__ == '__main__':
+    try:
+        with authorized_keyring(minimum=2) as (_, allowed):
+            print('Authorized primary keys: ' + ', '.join(sorted(allowed)))
+    except (SigningError, OSError, UnicodeError) as exc:
+        sys.exit(f'check-release-signing-policy: {exc}')
