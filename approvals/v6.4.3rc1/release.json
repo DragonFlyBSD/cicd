@@ -1,0 +1,9 @@
+{
+  "schema_version": "1",
+  "kind": "dragonfly-release-approval",
+  "origin_url": "https://git.quantumachine.net/antonioh/DragonFlyBSD.git",
+  "release_branch": "DragonFly_RELEASE_6_4",
+  "release_tag": "v6.4.3rc1",
+  "tag_object": "02f57708388a4354d567f4934bca87041c31eed3",
+  "commit": "1c730f94627deb64772c0d5b0ddca2a65441346b"
+}
