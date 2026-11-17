@@ -198,6 +198,18 @@ groovy tests/release-version.groovy
 groovy tests/release-workflow.groovy
 ```
 
+Patch selection also has a CPS regression check. Run it with Groovy 2.4 and
+`groovy-cps`, `groovy-sandbox`, and Guava on the classpath, for example:
+
+```sh
+groovy -cp 'groovy-cps.jar:groovy-sandbox.jar:guava.jar' tests/release-version-cps.groovy
+```
+
+It executes the actual tag-scanning helper through the CPS transform, checking
+that all tag refs are processed. Tested dependencies: groovy-cps 1.34,
+groovy-sandbox 1.34.1, Guava 31.1-jre. Plain Groovy tests cannot catch all CPS
+method mismatches (in particular native `String.eachLine` callbacks).
+
 The integration checks execute the pipeline's Git stages against disposable
 local repositories, including atomic push rejection and concurrent ref changes.
 They do not replace verification of Jenkins CPS, approval, or GPG integration.

@@ -38,7 +38,9 @@ def normalizeBranchName(String branch) {
 
 def nextPatchVersion(Map branchInfo, String tagRefs) {
     int highestPatch = 0
-    tagRefs.eachLine { line ->
+    // String.eachLine invokes a CPS closure from native Groovy and can stop
+    // after the first ref on Jenkins. Keep iteration inside the CPS interpreter.
+    for (String line : tagRefs.split(/\r?\n/)) {
         def fields = line.tokenize()
         if (fields.size() == 2) {
             def m = fields[1] =~ /^refs\/tags\/v(\d+)\.(\d+)\.(\d+)$/
