@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Review, sign and publish a release tag or its independent approval."""
+
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlsplit
+from urllib.request import urlopen
+
+from release_review import display
+from release_signing import SigningError, load_request
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['tag', 'approve'])
+    request = parser.add_mutually_exclusive_group(required=True)
+    request.add_argument('--request', type=Path)
+    request.add_argument('--build-url', help='HTTPS Jenkins build URL; downloads its public signing request')
+    parser.add_argument('--source-dir', type=Path, required=True, help='source checkout; cloned if absent')
+    parser.add_argument('--origin', required=True, help='independently known source origin URL')
+    parser.add_argument('--key', required=True, help='your full primary GPG fingerprint')
+    parser.add_argument('--previous-tag')
+    args = parser.parse_args()
+    scripts = Path(__file__).resolve().parent
+    cicd = scripts.parent
+    source = args.source_dir.expanduser().resolve()
+
+    def run(arguments, cwd=source):
+        subprocess.run(arguments, cwd=cwd, check=True)
+
+    # Keep pinentry attached to the invoking terminal, never accept a passphrase.
+    if sys.stdin.isatty():
+        os.environ['GPG_TTY'] = os.ttyname(sys.stdin.fileno())
+    with tempfile.TemporaryDirectory(prefix='release-sign-') as temporary:
+        request_path = args.request.expanduser().resolve() if args.request else Path(temporary) / 'request.json'
+        if args.build_url:
+            url = urlsplit(args.build_url)
+            if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
+                raise SigningError('--build-url must be an HTTPS build URL without credentials, query or fragment')
+            with urlopen(args.build_url.rstrip('/') + '/artifact/release-signing-request.json', timeout=30) as response:
+                if urlsplit(response.url).scheme != 'https':
+                    raise SigningError('request download redirected away from HTTPS')
+                content = response.read(65537)
+            if len(content) > 65536:
+                raise SigningError('downloaded request exceeds 64 KiB')
+            request_path.write_bytes(content)
+        document = load_request(request_path)
+        if document['origin_url'] != args.origin:
+            raise SigningError('request origin does not match --origin')
+        # Approval publication must not include unrelated developer changes.
+        if args.action == 'approve':
+            status = subprocess.check_output(['git', 'status', '--porcelain'], cwd=cicd)
+            if status:
+                raise SigningError('CI/CD checkout must be clean before publishing an approval')
+            branch = subprocess.check_output(['git', 'symbolic-ref', '--short', 'HEAD'], cwd=cicd).decode().strip()
+            if branch != 'master':
+                raise SigningError('approval publication requires the CI/CD master branch')
+        if not source.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            run(['git', 'clone', '--no-checkout', '--', args.origin, str(source)], cwd=source.parent)
+        command = [sys.executable, str(scripts / ('sign-release-tag' if args.action == 'tag' else 'approve-release')),
+                   '--key', args.key, '--origin', args.origin]
+        if args.previous_tag:
+            command += ['--previous-tag', args.previous_tag]
+        if args.action == 'approve':
+            command += ['--output-dir', str(cicd / 'approvals')]
+        tag = document['release_tag']
+        display(f'After successful review, publish {tag} {args.action} to origin? Type "publish" to continue:')
+        # Do not buffer input intended for the child review command.
+        answer = bytearray()
+        while True:
+            character = os.read(sys.stdin.fileno(), 1)
+            if character in (b'', b'\n'):
+                break
+            answer.extend(character)
+        if answer.strip() != b'publish':
+            raise SigningError('publication cancelled')
+        run(command + [str(request_path)])
+        if args.action == 'tag':
+            publication = ['git', 'push', 'origin', f'refs/tags/{tag}:refs/tags/{tag}']
+            target = source
+        else:
+            publication = ['git', 'push', 'origin', 'HEAD:refs/heads/master']
+            target = cicd
+            # Refuse accidentally publishing any other locally unpushed commits.
+            run(['git', 'fetch', 'origin', 'refs/heads/master'], cwd=cicd)
+            local = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=cicd)
+            remote = subprocess.check_output(['git', 'rev-parse', 'FETCH_HEAD'], cwd=cicd)
+            if local != remote:
+                raise SigningError('CI/CD master differs from origin; approval files remain local for review')
+        if args.action == 'approve':
+            paths = [f'approvals/{tag}/release.json', f'approvals/{tag}/second-signature.asc']
+            run(['git', 'add', '--', *paths], cwd=cicd)
+            run(['git', 'commit', '--only', '-m', f'release: approve {tag}', '--', *paths], cwd=cicd)
+        run(publication, cwd=target)
+        print(f'Published {tag} {args.action}; Jenkins can now continue.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (SigningError, OSError, UnicodeError, subprocess.CalledProcessError, EOFError) as exc:
+        sys.exit(f'release-sign: {exc}')

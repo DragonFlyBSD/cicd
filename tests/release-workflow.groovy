@@ -185,8 +185,16 @@ try {
     def patch = newBuild(basic, [BASE_BRANCH:'DragonFly_RELEASE_6_4', VERSION_BUMP:'patch', RELEASE_STAGE:'final'])
     prepare(patch)
     assert patch.env.TARGET_VERSION_COMPUTED == '6.4.3'
+    patch.stage('Archive Review Material')
+    def metadata = new groovy.json.JsonSlurper().parseText(new File(patch.workspace, 'release-metadata.json').text)
+    assert metadata.current_branch_marker == 'RELEASE_6_4'
     def previousRelease = head(basic, 'DragonFly_RELEASE_6_4')
     patch.stage('Commit And Push Branches')
+    patch.stage('Emit Signing Request')
+    def approvalCommand = new File(patch.workspace, 'tag-command.txt').readLines()
+        .find { it.startsWith('#   python scripts/release-sign approve ') }
+    assert approvalCommand.contains('--source-dir /path/to/source --request release-signing-request.json')
+    assert !approvalCommand.substring(1).contains('#')
     assert patch.env.RELEASE_COMMIT == previousRelease
     assert head(basic, 'master') == development
     assert head(basic, 'DragonFly_RELEASE_6_4') == previousRelease
@@ -291,9 +299,14 @@ try {
         fingerprints.eachWithIndex { fingerprint, index ->
             put(toolsSeed, "keys/authorized-signers/key-${index}.asc", gpg(['--armor', '--export', fingerprint]))
         }
+        put(toolsSeed, '.gitignore', '__pycache__/\n*.py[cod]\n')
         git(toolsSeed, ['add', '.'])
         git(toolsSeed, ['commit', '-m', 'Reviewed tools and two authorized keys'])
         def pin = git(toolsSeed, ['rev-parse', 'HEAD'])
+        def publicationOrigin = new File(root, 'approval-publication.git')
+        git(root, ['init', '--bare', publicationOrigin.path])
+        git(toolsSeed, ['remote', 'add', 'origin', publicationOrigin.path])
+        git(toolsSeed, ['push', 'origin', 'master'])
         def signedFixture = createFixture('signed-release')
         def signedBuild = newBuild(signedFixture, [RELEASE_TOOLS_COMMIT:pin], [
             RELEASE_TOOLS_URL:toolsSeed.toURI().toString().replaceFirst('^file:/', 'file:///'),
@@ -308,16 +321,25 @@ try {
         def request = new File(signedBuild.workspace, 'release-signing-request.json')
         def releaseTree = new File(signedBuild.workspace, 'release-src')
         def sourceOrigin = signedFixture.origin.toURI().toString().replaceFirst('^file:/', 'file:///')
-        def signedResult = run(releaseTree, [signingPython, new File(trusted, 'scripts/sign-release-tag').path,
-            '--key', fingerprints[0], '--origin', sourceOrigin, request.path], keyEnv, 'v6.6.0rc1\n')
+        def missingTag = run(signedBuild.workspace, [signingPython,
+            new File(trusted, 'scripts/poll-release-signing').path, 'tag'], signedBuild.env)
+        assert missingTag.status == 2 : missingTag.errors
+        def cancelled = run(releaseTree, [signingPython, new File(trusted, 'scripts/release-sign').path,
+            'tag', '--source-dir', releaseTree.path, '--request', request.path,
+            '--key', fingerprints[0], '--origin', sourceOrigin], keyEnv, 'cancel\n')
+        assert cancelled.status != 0
+        assert run(releaseTree, ['git', 'show-ref', '--verify', 'refs/tags/v6.6.0rc1']).status != 0
+        def signedResult = run(releaseTree, [signingPython, new File(trusted, 'scripts/release-sign').path, 'tag',
+            '--source-dir', releaseTree.path, '--request', request.path, '--key', fingerprints[0], '--origin', sourceOrigin], keyEnv, 'publish\nv6.6.0rc1\n')
         assert signedResult.status == 0 : signedResult.errors
-        git(releaseTree, ['push', 'origin', 'refs/tags/v6.6.0rc1'])
         signedBuild.stage('Await Signed Tag')
         rejects('still waiting') { signedBuild.stage('Await Second Approval') }
-        def approvalResult = run(releaseTree, [signingPython, new File(trusted, 'scripts/approve-release').path,
-            '--key', fingerprints[1], '--origin', sourceOrigin,
-            '--output-dir', new File(toolsSeed, 'approvals').path, request.path], keyEnv, 'v6.6.0rc1\n')
+        def approvalResult = run(releaseTree, [signingPython, new File(toolsSeed, 'scripts/release-sign').path, 'approve',
+            '--source-dir', releaseTree.path, '--request', request.path, '--key', fingerprints[1], '--origin', sourceOrigin], keyEnv, 'publish\nv6.6.0rc1\n')
         assert approvalResult.status == 0 : approvalResult.errors
+        assert git(toolsSeed, ['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']).readLines().sort() ==
+            ['approvals/v6.6.0rc1/release.json', 'approvals/v6.6.0rc1/second-signature.asc']
+        assert git(toolsSeed, ['rev-parse', 'HEAD']) == git(publicationOrigin, ['rev-parse', 'master'])
         // A newer approval commit also changes scripts and keys. Those changes
         // must never influence the pinned verification executed by Jenkins.
         def marker = new File(root, 'untrusted-verifier-executed')
@@ -340,7 +362,7 @@ try {
              new File(approvalDir, 'release.json').path])
         git(toolsSeed, ['add', '.'])
         git(toolsSeed, ['commit', '-m', 'Publish insufficient same-person approval'])
-        rejects('different authorized primary key') { signedBuild.stage('Await Second Approval') }
+        rejects('Approval fetch or verification failed') { signedBuild.stage('Await Second Approval') }
         // A tag replacement during the second-approval wait must not be hidden
         // by src's old fetched ref, even if the replacement is signed by key A.
         gpg(['--yes', '--armor', '--detach-sign', '--local-user', fingerprints[1],
@@ -353,7 +375,7 @@ try {
             keyEnv + [GIT_COMMITTER_DATE:'2001-01-01T00:00:00Z'])
         assert replacement.status == 0 : replacement.errors
         git(releaseTree, ['push', '--force', 'origin', 'refs/tags/v6.6.0rc1'])
-        rejects('manifest does not match') { signedBuild.stage('Await Second Approval') }
+        rejects('Approval fetch or verification failed') { signedBuild.stage('Await Second Approval') }
         def badPin = newBuild(createFixture('bad-pin'), [:], [RELEASE_TOOLS_COMMIT:'master'])
         rejects('reviewed full commit ID') { badPin.stage('Validate Parameters') }
         def editablePin = newBuild(createFixture('editable-pin'), [RELEASE_TOOLS_COMMIT:pin])

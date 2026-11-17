@@ -7,6 +7,52 @@ Assign the authorized keys to different maintainers; cryptography distinguishes
 primary keys, not the humans who control them. Different subkeys of one primary
 key do not count as two signers.
 
+## Guided signing and publication
+
+After installing the requirements below, each maintainer runs one command from
+an up-to-date, reviewed CI/CD checkout. Use the expected source URL and your own
+full primary fingerprint, obtained independently of the downloaded request:
+
+```sh
+python scripts/release-sign tag \
+  --build-url https://ci.dragonflybsd.org/job/DragonFly%20BSD%20Engineering%20Release/BUILD_NUMBER/ \
+  --source-dir ~/s/dragonfly-release \
+  --origin EXPECTED_SOURCE_ORIGIN --key FIRST_PRIMARY_FINGERPRINT
+```
+
+The first maintainer reviews the displayed source changes, authorizes publication,
+confirms the release review, and signs locally. The command pushes only that tag.
+A missing source checkout is cloned automatically. Existing checkouts keep their
+working tree and current branch; the request identifies the commit to review.
+
+The second maintainer uses their own reviewed CI/CD checkout and independent key:
+
+```sh
+python scripts/release-sign approve \
+  --build-url https://ci.dragonflybsd.org/job/DragonFly%20BSD%20Engineering%20Release/BUILD_NUMBER/ \
+  --source-dir ~/s/dragonfly-release \
+  --origin EXPECTED_SOURCE_ORIGIN --key SECOND_PRIMARY_FINGERPRINT
+```
+
+This verifies the first signature, presents source review, asks for publication consent,
+creates the detached approval after review, and commits and pushes the two approval files. The
+CI/CD checkout must be clean, on master, and match origin/master before publication;
+other unpushed commits are refused. A cancelled or failed publication leaves the
+signed evidence local for inspection and recovery using the manual steps below.
+No force pushes are used. Git authentication uses the developer's usual setup.
+Passphrases remain in GPG pinentry; GPG_TTY is set from the invoking terminal.
+
+Use `--request /path/to/release-signing-request.json` instead of `--build-url`
+for an already downloaded request. `--previous-tag` retains the manual comparison
+override. Request downloads are limited to 64 KiB and require HTTPS. The expected
+origin and review confirmations remain mandatory; a build URL is not a trust root.
+The lower-level scripts below remain available for manual review and recovery.
+
+Jenkins runs the pinned `scripts/poll-release-signing` for each signing phase.
+It owns temporary askpass cleanup, fetches, and verifier invocation. Exit 2 means
+missing evidence; network and verification failures stop the pipeline. Jenkins
+owns only scheduling, timeouts, credentials binding, and evidence archiving.
+
 ## Trust configuration
 
 Before a real run, an administrator configures `RELEASE_TOOLS_COMMIT` as the full
@@ -36,6 +82,10 @@ tools or authorized keys requires reviewing a new commit and deliberately
 updating `RELEASE_TOOLS_COMMIT`.
 
 Dry runs do not require a pin, signers or signatures, and publish nothing.
+
+When deploying the extracted signing-poll stages, select a reviewed tools commit
+containing `scripts/poll-release-signing`. Older pins are rejected before branch
+publication, rather than failing after the release has already been prepared.
 
 ## Requirements
 

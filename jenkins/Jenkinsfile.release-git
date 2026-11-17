@@ -315,6 +315,10 @@ EOF
                     git -C tools fetch --depth 1 origin "$RELEASE_TOOLS_COMMIT"
                     git -C tools checkout --detach FETCH_HEAD
                     test "$(git -C tools rev-parse HEAD)" = "$RELEASE_TOOLS_COMMIT"
+                    if [ ! -f tools/scripts/poll-release-signing ]; then
+                        echo "RELEASE_TOOLS_COMMIT predates the signing poll helper; select a reviewed updated tools commit." >&2
+                        exit 1
+                    fi
                     # This separate bare repo supplies approval DATA only. Its
                     # moving branch never supplies executable scripts or keys.
                     git init --bare approval-data.git
@@ -374,6 +378,7 @@ EOF
                     env.BASE_COMMIT = sh(returnStdout: true, script: 'git -C src rev-parse HEAD').trim()
                     env.CURRENT_BRANCH_KIND = branchInfo.kind
                     env.CURRENT_BRANCH_VERSION = "${branchInfo.major}.${branchInfo.minor}"
+                    env.CURRENT_BRANCH_MARKER = "${branchInfo.kind}_${branchInfo.major}_${branchInfo.minor}"
                     env.TARGET_VERSION_COMPUTED = versionString(target)
                     env.RELEASE_MAJOR = target.major.toString()
                     env.RELEASE_MINOR = target.minor.toString()
@@ -527,7 +532,7 @@ EOF
                         printf '  "base_branch": "%s",\n' "$BASE_BRANCH_NORMALIZED"
                         printf '  "base_commit": "%s",\n' "$BASE_COMMIT"
                         printf '  "action": "%s",\n' "$RELEASE_ACTION"
-                        printf '  "current_branch_marker": "%s_%s",\n' "$CURRENT_BRANCH_KIND" "$CURRENT_BRANCH_VERSION"
+                        printf '  "current_branch_marker": "%s",\n' "$CURRENT_BRANCH_MARKER"
                         printf '  "version_bump": "%s",\n' "$VERSION_BUMP"
                         printf '  "target_version": "%s",\n' "$TARGET_VERSION_COMPUTED"
                         printf '  "release_stage": "%s",\n' "$RELEASE_STAGE"
@@ -685,14 +690,12 @@ EOF
 # Tag:    $RELEASE_TAG
 # Commit: $RELEASE_COMMIT  (tip of $RELEASE_BRANCH on origin)
 #
-# Primary path (recommended): run the signing script, then push:
-#   scripts/sign-release-tag --key FIRST_PRIMARY_FINGERPRINT --origin EXPECTED_SOURCE_ORIGIN release-signing-request.json
-#   git push origin $RELEASE_TAG
+# First signer: review, sign and publish with one command:
+#   python scripts/release-sign tag --key FIRST_PRIMARY_FINGERPRINT --origin EXPECTED_SOURCE_ORIGIN --source-dir /path/to/source --request release-signing-request.json
 #
 # A second authorized person then reviews the pushed tag and runs:
-#   scripts/approve-release --key SECOND_PRIMARY_FINGERPRINT --origin EXPECTED_SOURCE_ORIGIN \
-#       --output-dir /path/to/cicd/approvals release-signing-request.json
-# Commit both generated approval files in the CI/CD repository.
+#   python scripts/release-sign approve --key SECOND_PRIMARY_FINGERPRINT --origin EXPECTED_SOURCE_ORIGIN --source-dir /path/to/source --request release-signing-request.json
+# The wrapper commits and pushes only the approval files after review.
 # Both signers must independently review the source before confirming.
 
 EOF
@@ -716,61 +719,20 @@ EOF
                         echo "Signer inputs are archived: release-signing-request.json and tag-command.txt."
                         timeout(time: env.SIGNED_TAG_TIMEOUT_HOURS.toInteger(), unit: 'HOURS') {
                             waitUntil(initialRecurrencePeriod: 60000) {
-                                def present = sh(returnStatus: true, script: '''
-                                    set -eu
-                                    cat > git-askpass.sh <<'EOF'
-#!/bin/sh
-case "$1" in
-*Username*) printf '%s\n' "$GITEA_USER" ;;
-*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
-*) printf '\n' ;;
-esac
-EOF
-                                    chmod 700 git-askpass.sh
-                                    export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
-                                    export GIT_TERMINAL_PROMPT=0
-                                    git ls-remote --exit-code --tags "$ORIGIN_URL" "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
-                                ''') == 0
-
-                                if (!present) {
+                                def rc = sh(returnStatus: true, script: '''
+                                    "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/poll-release-signing" tag
+                                ''')
+                                if (rc == 2) {
                                     echo "Signed tag ${env.RELEASE_TAG} not on origin yet; waiting..."
                                     return false
                                 }
-
-                                // Tag is present: fetch it and verify. A present-but-invalid
-                                // tag is a hard failure, not a reason to keep waiting.
-                                sh '''
-                                    set -eu
-                                    cat > git-askpass.sh <<'EOF'
-#!/bin/sh
-case "$1" in
-*Username*) printf '%s\n' "$GITEA_USER" ;;
-*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
-*) printf '\n' ;;
-esac
-EOF
-                                    chmod 700 git-askpass.sh
-                                    export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
-                                    export GIT_TERMINAL_PROMPT=0
-                                    cd "$WORKSPACE/src"
-                                    git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-                                '''
-
-                                def rc = sh(returnStatus: true, script: '''
-                                    set -eu
-                                    cd "$WORKSPACE/src"
-                                    AUTHORIZED_SIGNERS_DIR="$WORKSPACE/tools/keys/authorized-signers" \
-                                        "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/verify-release-tag" \
-                                        "$WORKSPACE/release-signing-request.json"
-                                ''')
                                 if (rc != 0) {
-                                    error("Signed tag ${env.RELEASE_TAG} is present on origin but failed verification against the authorized-signers allowlist. Refusing to proceed. (If keys/authorized-signers is empty, commit an authorized public key first.)")
+                                    error("Signed tag fetch or verification failed; refusing to proceed.")
                                 }
                                 echo "Signed tag ${env.RELEASE_TAG} verified against ${env.RELEASE_COMMIT}."
                                 return true
                             }
                         }
-                        sh 'rm -f "$WORKSPACE/git-askpass.sh"'
                     }
                 }
             }
@@ -790,46 +752,19 @@ EOF
                         timeout(time: env.SECOND_APPROVAL_TIMEOUT_HOURS.toInteger(), unit: 'HOURS') {
                             waitUntil(initialRecurrencePeriod: 60000) {
                                 def rc = sh(returnStatus: true, script: '''
-                                set -eu
-                                export GIT_TERMINAL_PROMPT=0
-                                "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/fetch-release-approval" \
-                                    --git-dir "$WORKSPACE/approval-data.git" --ref "$RELEASE_APPROVALS_REF" \
-                                    --tag "$RELEASE_TAG" --output "$WORKSPACE/release-approval"
-                            ''')
+                                    "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/poll-release-signing" approval
+                                ''')
                                 if (rc == 2) {
                                     echo "Waiting for approvals/${env.RELEASE_TAG}/release.json and second-signature.asc in the CI/CD repository."
                                     return false
                                 }
                                 if (rc != 0) {
-                                    error('Fetching approval data failed; refusing to treat a fetch error as a missing approval.')
+                                    error('Approval fetch or verification failed; refusing to proceed.')
                                 }
-                                sh '''
-                                set -eu
-                                cat > git-askpass.sh <<'EOF'
-#!/bin/sh
-case "$1" in
-*Username*) printf '%s\n' "$GITEA_USER" ;;
-*Password*) printf '%s\n' "$GITEA_TOKEN" ;;
-*) printf '\n' ;;
-esac
-EOF
-                                chmod 700 git-askpass.sh
-                                export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
-                                export GIT_TERMINAL_PROMPT=0
-                                cd "$WORKSPACE/src"
-                                # The tag may have moved during the approval wait.
-                                # Verify the current remote object against the evidence.
-                                git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-                                AUTHORIZED_SIGNERS_DIR="$WORKSPACE/tools/keys/authorized-signers" \
-                                    "$SIGNING_PYTHON" "$WORKSPACE/tools/scripts/verify-release-approval" \
-                                    --report "$WORKSPACE/release-approval/verification.json" \
-                                    "$WORKSPACE/release-signing-request.json" "$WORKSPACE/release-approval"
-                            '''
                                 archiveArtifacts artifacts: 'release-approval/*', allowEmptyArchive: false
                                 return true
                             }
                         }
-                        sh 'rm -f "$WORKSPACE/git-askpass.sh"'
                     }
                 }
             }
